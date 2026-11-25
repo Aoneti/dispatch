@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import type { PageKey } from "../lib/types";
 import { GEMINI_MODEL } from "../lib/types";
-import { cn, formatRelative } from "../lib/utils";
+import { cn, formatRelative, pluralRu } from "../lib/utils";
 import { useStore } from "../lib/store";
 import { IconButton, StatusDot } from "./ui";
 
@@ -60,6 +60,7 @@ function SidebarContent({
 }) {
   const { articles, sources, drafts, settings } = useStore();
 
+  const unread = articles.filter((a) => a.readAt === null).length;
   const counts: Partial<Record<PageKey, number>> = {
     inbox: articles.length,
     sources: sources.length,
@@ -104,9 +105,13 @@ function SidebarContent({
               )}
               <span className={cn("shrink-0", active ? "text-ink" : "text-faint")}>{item.icon}</span>
               <span className="flex-1 truncate">{item.label}</span>
-              {typeof count === "number" && count > 0 && (
+              {item.key === "inbox" && unread > 0 ? (
+                <span className="inline-flex h-5 items-center rounded-[3px] bg-accent-soft px-1.5 font-mono text-[10.5px] font-medium leading-none text-accent-ink">
+                  {unread}
+                </span>
+              ) : typeof count === "number" && count > 0 ? (
                 <span className="font-mono text-[10px] leading-none text-faint">{count}</span>
-              )}
+              ) : null}
             </button>
           );
         })}
@@ -187,9 +192,10 @@ export function Topbar({
   page: PageKey;
   onOpenMobile: () => void;
 }) {
-  const { sources, settings, updateSettings, refreshAll, isRefreshingAll } = useStore();
+  const { sources, articles, settings, updateSettings, refreshAll, isRefreshingAll } = useStore();
   const hasEnabled = sources.some((source) => source.enabled);
   const latestSync = sources.reduce((max, source) => Math.max(max, source.lastSyncAt || 0), 0);
+  const unread = articles.filter((a) => a.readAt === null).length;
   const isDark =
     settings.theme === "dark" ||
     (settings.theme === "system" &&
@@ -205,6 +211,12 @@ export function Topbar({
       <span className="font-serif text-[16px] font-semibold text-ink lg:text-[14px] lg:font-sans lg:font-medium">
         {PAGE_LABELS[page]}
       </span>
+
+      {page === "inbox" && unread > 0 && (
+        <span className="hidden font-mono text-[10.5px] text-faint sm:inline">
+          {pluralRu(unread, "непрочитанная", "непрочитанные", "непрочитанных")}
+        </span>
+      )}
 
       <div className="ml-auto flex items-center gap-1.5">
         {hasEnabled && (

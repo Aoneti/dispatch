@@ -28,8 +28,10 @@ import {
   Field,
   Input,
   Segmented,
+  Select,
+  Toggle,
 } from "../components/ui";
-import { downloadFile, formatRelative, pluralRu } from "../lib/utils";
+import { downloadFile, formatNumber, formatRelative, pluralRu } from "../lib/utils";
 
 type TestState =
   | { kind: "idle" }
@@ -48,6 +50,7 @@ export function SettingsPage() {
     exportWorkspace,
     importWorkspace,
     clearAllData,
+    purgeOldArticles,
     notify,
   } = useStore();
 
@@ -154,6 +157,7 @@ export function SettingsPage() {
   };
 
   const last4 = savedKey ? savedKey.slice(-4) : "";
+  const usage = settings.geminiUsage;
 
   return (
     <div className="mx-auto w-full max-w-[780px] space-y-5 px-4 pb-12 pt-5 sm:px-6">
@@ -162,7 +166,7 @@ export function SettingsPage() {
           Настройки
         </h1>
         <p className="mt-1 text-[12.5px] text-muted">
-          Подключение Google Gemini, оформление и локальные данные.
+          Подключение Google Gemini, оформление, RSS и локальные данные.
         </p>
       </div>
 
@@ -381,52 +385,110 @@ export function SettingsPage() {
               тем, у кого есть доступ к профилю — при необходимости отзовите ключ в Google AI Studio.
             </p>
           </div>
+
+          {/* Компактная статистика использования */}
+          <div className="border-t border-line pt-3">
+            <p className="text-[11px] font-medium text-muted">Статистика использования Gemini</p>
+            <div className="mt-2 grid grid-cols-2 gap-2 text-[11.5px] sm:grid-cols-4">
+              <div>
+                <p className="text-faint">Запросов</p>
+                <p className="font-medium text-ink">{formatNumber(usage.requests)}</p>
+              </div>
+              <div>
+                <p className="text-faint">Успешных</p>
+                <p className="font-medium text-ink">{formatNumber(usage.successful)}</p>
+              </div>
+              <div>
+                <p className="text-faint">Ошибок</p>
+                <p className="font-medium text-ink">{formatNumber(usage.errors)}</p>
+              </div>
+              <div>
+                <p className="text-faint">Токенов</p>
+                <p className="font-medium text-ink">{formatNumber(usage.totalTokens)}</p>
+              </div>
+            </div>
+            {usage.lastRequestAt && (
+              <p className="mt-1 text-[10.5px] text-faint">
+                Последний запрос: {formatRelative(usage.lastRequestAt).toLowerCase()}
+              </p>
+            )}
+          </div>
         </div>
       </section>
 
-      {/* Раздел 2: Оформление */}
+      {/* Раздел 2: Оформление и чтение */}
       <section className="overflow-hidden rounded-[8px] border border-line bg-surface shadow-card">
-        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5 sm:px-5">
-          <div>
-            <h2 className="text-[14px] font-semibold text-ink">Тема оформления</h2>
+        <div className="border-b border-line px-4 py-3 sm:px-5">
+          <h2 className="text-[14px] font-semibold text-ink">Оформление и чтение</h2>
+          <p className="mt-0.5 text-[11.5px] text-muted">
+            Тема, автоматическое прочтение и интервал обновления RSS.
+          </p>
+        </div>
+
+        <div className="space-y-4 px-4 py-4 sm:px-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-[13px] font-medium text-ink">Тема оформления</p>
+              <p className="mt-0.5 text-[11.5px] text-muted">
+                Применяется сразу и сохраняется локально.
+              </p>
+            </div>
+            <Segmented<ThemeMode>
+              value={settings.theme}
+              onChange={(theme) => updateSettings({ theme })}
+              options={[
+                {
+                  value: "light",
+                  label: (
+                    <>
+                      <Sun size={12} /> Светлая
+                    </>
+                  ),
+                },
+                {
+                  value: "dark",
+                  label: (
+                    <>
+                      <Moon size={12} /> Тёмная
+                    </>
+                  ),
+                },
+                {
+                  value: "system",
+                  label: (
+                    <>
+                      <Monitor size={12} /> Системная
+                    </>
+                  ),
+                },
+              ]}
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+            <div>
+              <p className="text-[13px] font-medium text-ink">Автоматически отмечать прочитанной при открытии</p>
+              <p className="mt-0.5 text-[11.5px] text-muted">
+                Статья помечается прочитанной только при реальном открытии. Вернуть в непрочитанные можно в любой момент.
+              </p>
+            </div>
+            <Toggle
+              checked={settings.autoMarkRead}
+              onChange={(checked) => updateSettings({ autoMarkRead: checked })}
+              label="Автоматически отмечать прочитанной при открытии"
+            />
+          </div>
+
+          <div className="border-t border-line pt-4">
+            <p className="text-[13px] font-medium text-ink">Обновление RSS-лент</p>
             <p className="mt-0.5 text-[11.5px] text-muted">
-              Применяется сразу и сохраняется локально.
+              Автоматическое обновление выполняется каждые 30 минут. Ручная кнопка «Обновить» всегда доступна.
             </p>
           </div>
-          <Segmented<ThemeMode>
-            value={settings.theme}
-            onChange={(theme) => updateSettings({ theme })}
-            options={[
-              {
-                value: "light",
-                label: (
-                  <>
-                    <Sun size={12} /> Светлая
-                  </>
-                ),
-              },
-              {
-                value: "dark",
-                label: (
-                  <>
-                    <Moon size={12} /> Тёмная
-                  </>
-                ),
-              },
-              {
-                value: "system",
-                label: (
-                  <>
-                    <Monitor size={12} /> Системная
-                  </>
-                ),
-              },
-            ]}
-          />
         </div>
       </section>
 
-      {/* Раздел 3: Локальные данные и резервная копия */}
+      {/* Раздел 3: Данные и хранилище */}
       <section className="overflow-hidden rounded-[8px] border border-line bg-surface shadow-card">
         <div className="border-b border-line px-4 py-3 sm:px-5">
           <h2 className="text-[14px] font-semibold text-ink">Данные и резервная копия</h2>
@@ -438,8 +500,38 @@ export function SettingsPage() {
           </p>
         </div>
 
-        <div className="space-y-3 px-4 py-4 sm:px-5">
-          <div className="flex flex-wrap items-center gap-2">
+        <div className="space-y-4 px-4 py-4 sm:px-5">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+            <div>
+              <p className="text-[13px] font-medium text-ink">Удалять старые прочитанные статьи</p>
+              <p className="mt-0.5 text-[11.5px] text-muted">
+                Сохранённые и непрочитанные материалы никогда не удаляются автоматически.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[12px] text-muted">Срок:</span>
+              <Select
+                value={String(settings.retentionDays)}
+                onChange={(e) => updateSettings({ retentionDays: Number(e.target.value) })}
+                disabled={!settings.autoCleanupEnabled}
+                className="h-8 w-[110px] text-[12px]"
+                aria-label="Срок хранения прочитанных статей"
+              >
+                {[7, 14, 30, 60, 90, 180].map((d) => (
+                  <option key={d} value={d}>
+                    {d} дн.
+                  </option>
+                ))}
+              </Select>
+              <Toggle
+                checked={settings.autoCleanupEnabled}
+                onChange={(checked) => updateSettings({ autoCleanupEnabled: checked })}
+                label="Включить очистку старых прочитанных статей"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 border-t border-line pt-4">
             <Button
               variant="secondary"
               size="sm"
@@ -463,6 +555,26 @@ export function SettingsPage() {
               icon={<Upload size={13} />}
             >
               Импортировать JSON
+            </Button>
+
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!settings.autoCleanupEnabled}
+              onClick={() => {
+                const removed = purgeOldArticles();
+                notify({
+                  title: removed > 0 ? "Старые статьи удалены" : "Удалять нечего",
+                  description:
+                    removed > 0
+                      ? `Удалено: ${pluralRu(removed, "старая статья", "старые статьи", "старых статей")}.`
+                      : "Нет прочитанных статей старше выбранного срока.",
+                  variant: removed > 0 ? "success" : "info",
+                });
+              }}
+              icon={<Trash2 size={13} />}
+            >
+              Очистить сейчас
             </Button>
 
             <Button

@@ -12,6 +12,7 @@ import {
   FeedError,
   feedItemToArticle,
   runWithConcurrency,
+  syncOlderPages,
   syncSourceFeed,
 } from "./feeds";
 import { createEmptyWorkspace } from "./seed";
@@ -23,6 +24,7 @@ import type {
   DraftFormat,
   DraftStatus,
   ExtractionStatus,
+  MassChangeUndo,
   ParsedFeed,
   Settings,
   Source,
@@ -40,7 +42,7 @@ import {
   LEGACY_SEED_SOURCE_IDS,
   SCHEMA_VERSION,
 } from "./types";
-import { charCount, pluralRu, uid } from "./utils";
+import { charCount, pluralRu, sanitizeHtml, uid } from "./utils";
 
 const WORKSPACE_KEY = "dispatch.workspace.v1";
 const WORKSPACE_SAVED_AT_KEY = "dispatch.workspace.savedAt.v1";
@@ -195,6 +197,13 @@ export function migrateWorkspaceData(
     articleIds.add(item.id);
     const contentText = typeof item.contentText === "string" ? item.contentText : "";
     const linkedSource = sourceById.get(sourceId);
+    // Совместимость со старой схемой: раньше прочтение хранилось как isRead.
+    const legacyIsRead = Boolean((item as Record<string, unknown>).isRead);
+    const legacyIsSaved = Boolean((item as Record<string, unknown>).isSaved);
+    const readAt =
+      typeof item.readAt === "number" ? item.readAt : legacyIsRead ? (typeof item.publishedAt === "number" ? item.publishedAt : Date.now()) : null;
+    const savedAt =
+      typeof item.savedAt === "number" ? item.savedAt : legacyIsSaved ? Date.now() : null;
     articles.push({
       id: item.id,
       sourceId,
@@ -208,11 +217,15 @@ export function migrateWorkspaceData(
       publishedAt: typeof item.publishedAt === "number" ? item.publishedAt : Date.now(),
       fetchedAt: typeof item.fetchedAt === "number" ? item.fetchedAt : Date.now(),
       excerpt: typeof item.excerpt === "string" ? item.excerpt : "",
-      contentHtml: typeof item.contentHtml === "string" ? item.contentHtml : "",
+      // Санитизация HTML при каждом чтении из хранилища — защита от старых повреждённых записей.
+      contentHtml: sanitizeHtml(typeof item.contentHtml === "string" ? item.contentHtml : ""),
       contentText,
       extraction: normalizeExtraction(item.extraction),
       extractionNote: typeof item.extractionNote === "string" ? item.extractionNote : undefined,
       charCount: typeof item.charCount === "number" && item.charCount >= 0 ? item.charCount : charCount(contentText),
+      readAt,
+      savedAt,
+      feedOrder: typeof item.feedOrder === "number" ? item.feedOrder : 0,
     });
   }
 
@@ -305,13 +318,28 @@ export function migrateWorkspaceData(
   }
 
   const rawSettings = isRecord(raw.settings) ? raw.settings : {};
+  const rawUsage = isRecord(rawSettings.geminiUsage) ? rawSettings.geminiUsage : {};
   const settings: Settings = {
     apiKey: options.preserveApiKey !== false ? loadApiKey() : "",
     model: GEMINI_MODEL,
     theme: normalizeTheme(rawSettings.theme),
     privacyAcknowledged: Boolean(rawSettings.privacyAcknowledged),
+    autoMarkRead: rawSettings.autoMarkRead !== false,
+    autoCleanupEnabled: rawSettings.autoCleanupEnabled === true,
+    retentionDays: typeof rawSettings.retentionDays === "number" && rawSettings.retentionDays > 0 ? rawSettings.retentionDays : 30,
     lastTestedAt: typeof rawSettings.lastTestedAt === "number" ? rawSettings.lastTestedAt : null,
     lastSyncAllAt: typeof rawSettings.lastSyncAllAt === "number" ? rawSettings.lastSyncAllAt : null,
+    geminiUsage: {
+      requests: Number(rawUsage.requests) || 0,
+      successful: Number(rawUsage.successful) || 0,
+      errors: Number(rawUsage.errors) || 0,
+      inputTokens: Number(rawUsage.inputTokens) || 0,
+      outputTokens: Number(rawUsage.outputTokens) || 0,
+      totalTokens: Number(rawUsage.totalTokens) || 0,
+      lastRequestAt: typeof rawUsage.lastRequestAt === "number" ? rawUsage.lastRequestAt : null,
+      lastErrorAt: typeof rawUsage.lastErrorAt === "number" ? rawUsage.lastErrorAt : null,
+      lastErrorKind: typeof rawUsage.lastErrorKind === "string" ? rawUsage.lastErrorKind : null,
+    },
   };
 
   if (rawSettings.model && rawSettings.model !== GEMINI_MODEL) {
@@ -400,6 +428,33 @@ export function parseImportPayload(
   };
 }
 
+// Отправляет актуальный счётчик непрочитанных в фоновый service worker для значка расширения.
+export function pushUnreadCountToBadge(articles: Article[]) {
+  const count = articles.filter((a) => a.readAt === null).length;
+  try {
+    const chromeApi = (
+      globalThis as unknown as {
+        chrome?: {
+          storage?: {
+            local?: { set: (items: Record<string, unknown>) => Promise<void> };
+          };
+          runtime?: { sendMessage?: (message: unknown) => Promise<unknown> };
+        };
+      }
+    ).chrome;
+    const local = chromeApi?.storage?.local;
+    if (local?.set) {
+      void local.set({ dispatchUnreadCount: count }).catch(() => undefined);
+    }
+    const runtime = chromeApi?.runtime;
+    if (runtime?.sendMessage) {
+      void runtime.sendMessage({ type: "dispatch:unread-count", count }).catch(() => undefined);
+    }
+  } catch {
+    // Вне расширения значок недоступен.
+  }
+}
+
 function syncErrorMessage(error: unknown) {
   if (error instanceof FeedError) return error.message;
   if (error instanceof Error && error.message) return error.message;
@@ -432,6 +487,14 @@ interface StoreContextValue {
   toggleSource: (id: string) => void;
   refreshSource: (id: string, requestPermission?: boolean) => Promise<boolean>;
   refreshAll: (fromUserGesture?: boolean) => Promise<void>;
+  loadOlderArticles: (sourceId: string) => Promise<{ added: number; pagesFetched: number; finished: boolean }>;
+  markRead: (id: string, read: boolean) => void;
+  toggleSaved: (id: string) => void;
+  markAllReadInView: (articleIds: string[], label?: string) => void;
+  markAllReadInSource: (sourceId: string) => void;
+  undoMassChange: () => void;
+  purgeOldArticles: () => number;
+  recordGeminiUsage: (stats: { inputTokens?: number; outputTokens?: number; error?: boolean; kind?: string }) => void;
   deleteArticle: (id: string) => void;
   updateArticleExtraction: (
     id: string,
@@ -470,6 +533,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const dataRef = useRef(data);
   dataRef.current = data;
   const persistTimer = useRef<number | null>(null);
+  const massUndoRef = useRef<MassChangeUndo | null>(null);
 
   const notify = useCallback((toast: Omit<ToastMessage, "id">) => {
     const message: ToastMessage = { ...toast, id: uid("toast") };
@@ -508,11 +572,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   );
 
   // Восстановление и безопасная миграция из IndexedDB при запуске.
+  // Используем функциональный апдейт setData, чтобы не затереть свежий IndexedDB-контент
+  // устаревшим dataRef.current.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const record = await readWorkspaceRecord();
       if (cancelled) return;
+      let shouldWrite = shouldWriteAfterHydrate.current;
       if (record) {
         let localSavedAt = 0;
         let hasLocal = false;
@@ -525,17 +592,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (!hasLocal || record.savedAt > localSavedAt) {
           const migrated = migrateWorkspaceData(record.data, { preserveApiKey: true });
           if (migrated) {
-            if (migrated.migrated) shouldWriteAfterHydrate.current = true;
-            setData((current) => ({
-              ...migrated.data,
-              settings: { ...migrated.data.settings, apiKey: current.settings.apiKey },
-            }));
+            shouldWrite = true;
+            setData((current) => {
+              const merged = {
+                ...migrated.data,
+                settings: { ...migrated.data.settings, apiKey: current.settings.apiKey },
+              };
+              return merged;
+            });
           }
         }
       }
-      if (shouldWriteAfterHydrate.current) {
+      if (shouldWrite) {
         shouldWriteAfterHydrate.current = false;
-        writeNow(dataRef.current);
+        // После setData(…) вызываем запись именно в тот момент, когда React применил новый state.
+        setTimeout(() => {
+          if (!cancelled) writeNow(dataRef.current);
+        }, 0);
       }
       setHydrated(true);
     })().catch(() => setHydrated(true));
@@ -1001,6 +1074,233 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }));
   }, []);
 
+  const markRead = useCallback((id: string, read: boolean) => {
+    setData((current) => ({
+      ...current,
+      articles: current.articles.map((article) =>
+        article.id === id ? { ...article, readAt: read ? Date.now() : null } : article
+      ),
+    }));
+  }, []);
+
+  const toggleSaved = useCallback((id: string) => {
+    setData((current) => ({
+      ...current,
+      articles: current.articles.map((article) =>
+        article.id === id ? { ...article, savedAt: article.savedAt ? null : Date.now() } : article
+      ),
+    }));
+  }, []);
+
+  const markAllReadInView = useCallback(
+    (articleIds: string[], label = "Отмечено прочитанным") => {
+      const ids = new Set(articleIds);
+      const affected: Array<{ id: string; readAt: number | null; savedAt: number | null }> = [];
+      const now = Date.now();
+
+      setData((current) => {
+        current.articles.forEach((article) => {
+          if (ids.has(article.id) && !article.readAt) {
+            affected.push({ id: article.id, readAt: article.readAt, savedAt: article.savedAt });
+          }
+        });
+        if (affected.length === 0) return current;
+        return {
+          ...current,
+          articles: current.articles.map((article) =>
+            ids.has(article.id) && !article.readAt ? { ...article, readAt: now } : article
+          ),
+        };
+      });
+
+      if (affected.length > 0) {
+        massUndoRef.current = { label: "Отменить прочтение", changedIds: affected };
+        notify({
+          title: label,
+          description: `Изменено: ${pluralRu(affected.length, "статья", "статьи", "статей")}.`,
+          variant: "success",
+          action: { label: "Отменить", onClick: () => undoMassChangeRef.current?.() },
+        });
+      }
+    },
+    [notify]
+  );
+
+  const markAllReadInSource = useCallback(
+    (sourceId: string) => {
+      const source = dataRef.current.sources.find((s) => s.id === sourceId);
+      const ids = dataRef.current.articles.filter((a) => a.sourceId === sourceId && !a.readAt).map((a) => a.id);
+      if (ids.length === 0) {
+        notify({ title: "Непрочитанных нет", description: "Все статьи этого источника уже прочитаны.", variant: "info" });
+        return;
+      }
+      markAllReadInView(ids, `Источник «${source?.name || "Источник"}» отмечен прочитанным`);
+    },
+    [markAllReadInView, notify]
+  );
+
+  const undoMassChange = useCallback(() => {
+    const undo = massUndoRef.current;
+    if (!undo) return;
+    setData((current) => {
+      const map = new Map(undo.changedIds.map((entry) => [entry.id, entry]));
+      return {
+        ...current,
+        articles: current.articles.map((article) => {
+          const prev = map.get(article.id);
+          if (!prev) return article;
+          return { ...article, readAt: prev.readAt, savedAt: prev.savedAt };
+        }),
+      };
+    });
+    notify({ title: "Действие отменено", description: "Статусы статей восстановлены.", variant: "info" });
+    massUndoRef.current = null;
+  }, [notify]);
+
+  // Ссылка для использования внутри notify callback.
+  const undoMassChangeRef = useRef<() => void>(() => undoMassChange());
+  undoMassChangeRef.current = undoMassChange;
+
+  const purgeOldArticles = useCallback(() => {
+    const current = dataRef.current;
+    if (!current.settings.autoCleanupEnabled) return 0;
+    const cutoff = Date.now() - Math.max(1, current.settings.retentionDays) * 86_400_000;
+    const draftArticleIds = new Set(current.drafts.map((draft) => draft.articleId));
+    const retained = current.articles.filter(
+      (article) => article.savedAt !== null || article.readAt === null || article.publishedAt >= cutoff || draftArticleIds.has(article.id)
+    );
+    const removed = current.articles.length - retained.length;
+    if (removed > 0) {
+      setData((state) => ({
+        ...state,
+        articles: retained,
+        sources: state.sources.map((source) => ({
+          ...source,
+          articleCount: retained.filter((article) => article.sourceId === source.id).length,
+        })),
+      }));
+    }
+    return removed;
+  }, []);
+
+  const loadOlderArticles = useCallback(
+    async (sourceId: string) => {
+      const source = dataRef.current.sources.find((item) => item.id === sourceId);
+      if (!source || !source.nextOlderPage) {
+        return { added: 0, pagesFetched: 0, finished: true };
+      }
+      if (syncingIds.includes(sourceId)) {
+        return { added: 0, pagesFetched: 0, finished: false };
+      }
+
+      const granted = await ensureHostAccess(source.nextOlderPage);
+      if (!granted) {
+        notify({
+          title: `Нет доступа к архиву «${source.name}»`,
+          description: "Разрешите доступ в окне Chrome, чтобы загрузить более старые публикации.",
+          variant: "warning",
+        });
+        return { added: 0, pagesFetched: 0, finished: false };
+      }
+
+      setSyncingIds((current) => [...current, sourceId]);
+      setData((current) => ({
+        ...current,
+        sources: current.sources.map((item) => (item.id === sourceId ? { ...item, status: "syncing" } : item)),
+      }));
+
+      try {
+        const visited = new Set<string>([source.url]);
+        const result = await syncOlderPages(source, dataRef.current.articles, visited);
+        if (result.articles.length > 0) {
+          setData((current) => {
+            const existingKeys = new Set(current.articles.flatMap((article) => articleDedupeKeys(article)));
+            const fresh: Article[] = [];
+            for (const article of result.articles) {
+              const keys = articleDedupeKeys(article);
+              if (keys.some((key) => existingKeys.has(key))) continue;
+              keys.forEach((key) => existingKeys.add(key));
+              fresh.push(article);
+            }
+            const nextArticles = [...current.articles, ...fresh];
+            return {
+              ...current,
+              articles: nextArticles,
+              sources: current.sources.map((item) =>
+                item.id === sourceId
+                  ? {
+                      ...item,
+                      status: "ok",
+                      lastError: null,
+                      lastSyncAt: Date.now(),
+                      articleCount: nextArticles.filter((a) => a.sourceId === sourceId).length,
+                      nextOlderPage: result.finished ? undefined : result.nextOlderPage ?? item.nextOlderPage,
+                    }
+                  : item
+              ),
+            };
+          });
+        } else {
+          setData((current) => ({
+            ...current,
+            sources: current.sources.map((item) =>
+              item.id === sourceId
+                ? {
+                    ...item,
+                    status: "ok",
+                    nextOlderPage: result.finished ? undefined : result.nextOlderPage ?? item.nextOlderPage,
+                  }
+                : item
+            ),
+          }));
+        }
+        notify({
+          title: `Архив «${source.name}» загружен`,
+          description: `Добавлено: ${pluralRu(result.articles.length, "старая статья", "старые статьи", "старых статей")}${result.pagesFetched > 0 ? ` (${pluralRu(result.pagesFetched, "страница", "страницы", "страниц")})` : ""}.`,
+          variant: "success",
+        });
+        return { added: result.articles.length, pagesFetched: result.pagesFetched, finished: result.finished };
+      } catch (error) {
+        applySyncError(sourceId, error);
+        notify({
+          title: `Не удалось загрузить архив «${source.name}»`,
+          description: syncErrorMessage(error),
+          variant: "error",
+        });
+        return { added: 0, pagesFetched: 0, finished: false };
+      } finally {
+        setSyncingIds((current) => current.filter((entry) => entry !== sourceId));
+      }
+    },
+    [applySyncError, notify, syncingIds]
+  );
+
+  const recordGeminiUsage = useCallback(
+    (stats: { inputTokens?: number; outputTokens?: number; error?: boolean; kind?: string }) => {
+      setData((current) => {
+        const usage = current.settings.geminiUsage;
+        const next = { ...usage };
+        next.requests += 1;
+        if (stats.error) {
+          next.errors += 1;
+          next.lastErrorAt = Date.now();
+          next.lastErrorKind = stats.kind || "unknown";
+        } else {
+          next.successful += 1;
+        }
+        next.inputTokens += stats.inputTokens || 0;
+        next.outputTokens += stats.outputTokens || 0;
+        next.totalTokens += (stats.inputTokens || 0) + (stats.outputTokens || 0);
+        next.lastRequestAt = Date.now();
+        return {
+          ...current,
+          settings: { ...current.settings, geminiUsage: next },
+        };
+      });
+    },
+    []
+  );
+
   const resetDraftToOriginal = useCallback(
     (id: string) => {
       setData((current) => ({
@@ -1102,6 +1402,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       exportWorkspace,
       importWorkspace,
       clearAllData,
+      loadOlderArticles,
+      markRead,
+      toggleSaved,
+      markAllReadInView,
+      markAllReadInSource,
+      undoMassChange,
+      purgeOldArticles,
+      recordGeminiUsage,
     }),
     [
       addSource,
@@ -1129,6 +1437,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       updateDraft,
       updateSettings,
       updateSource,
+      loadOlderArticles,
+      markRead,
+      toggleSaved,
+      markAllReadInView,
+      markAllReadInSource,
+      undoMassChange,
+      purgeOldArticles,
+      recordGeminiUsage,
     ]
   );
 

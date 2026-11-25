@@ -1,4 +1,5 @@
 import type { Article, ParsedFeed, ParsedFeedItem, Source } from "./types";
+import { FEED_FETCH_MAX_ITEMS, FEED_OLDER_PAGES_LIMIT } from "./types";
 import { charCount, normalizeText, normalizeUrl, sanitizeHtml, stripHtml } from "./utils";
 
 const FEED_TIMEOUT_MS = 18_000;
@@ -110,17 +111,52 @@ function childText(parent: Element, names: string[]): string {
   return "";
 }
 
-function atomLink(entry: Element): string {
+function atomLink(entry: Element, baseUrl: string): string {
   const links = Array.from(entry.querySelectorAll("link"));
   const alternate =
     links.find((link) => (link.getAttribute("rel") || "alternate") === "alternate") || links[0];
-  return alternate?.getAttribute("href")?.trim() || childText(entry, ["id"]);
+  const href = alternate?.getAttribute("href")?.trim() || childText(entry, ["id"]);
+  if (!href) return "";
+  try {
+    return new URL(href, baseUrl).toString();
+  } catch {
+    return href;
+  }
 }
 
-function firstDate(value: string): number {
-  if (!value) return Date.now();
+function firstDate(value: string, fallback: number): number {
+  if (!value) return fallback;
   const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : Date.now();
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function resolveUrl(value: string, baseUrl: string): string {
+  if (!value) return "";
+  try {
+    return new URL(value, baseUrl).toString();
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Находит ссылку на следующую более старую страницу ленты (RFC 5005).
+ * Для RSS 2.0 ищет atom:link rel="next" или rel="prev-archive".
+ * Для Atom ищет <link rel="next"> или rel="prev-archive".
+ */
+function findOlderPageLink(doc: Document, baseUrl: string): string | null {
+  const links = Array.from(doc.querySelectorAll("link"));
+  for (const link of links) {
+    const rel = (link.getAttribute("rel") || "").trim().toLowerCase();
+    if (rel === "next" || rel === "prev-archive") {
+      const href = link.getAttribute("href")?.trim();
+      if (href) {
+        const resolved = resolveUrl(href, baseUrl);
+        if (resolved && normalizeUrl(resolved)) return resolved;
+      }
+    }
+  }
+  return null;
 }
 
 function cleanTitle(value: string, fallback: string) {
@@ -179,10 +215,11 @@ export function parseFeedXml(xml: string, fallbackUrl: string): ParsedFeed {
       : Array.from(doc.querySelectorAll("item, entry"));
 
   const items: ParsedFeedItem[] = [];
-  for (const item of rawItems) {
+  for (let index = 0; index < rawItems.length; index += 1) {
+    const item = rawItems[index];
     const itemTitle = childText(item, ["title"]);
     const link = isAtom
-      ? atomLink(item)
+      ? atomLink(item, fallbackUrl)
       : childText(item, ["link", "guid"]) || item.getAttribute("about") || "";
     const guid = isAtom
       ? childText(item, ["id"]) || link
@@ -196,14 +233,16 @@ export function parseFeedXml(xml: string, fallbackUrl: string): ParsedFeed {
     const content = contentFromItem(item, isAtom);
     const rawDesc = stripHtml(childText(item, ["summary", "description"]));
     if (!itemTitle && !link) continue;
-    const canonicalLink = normalizeUrl(link) || normalizeUrl(fallbackUrl);
+    const canonicalLink = normalizeUrl(resolveUrl(link, fallbackUrl)) || normalizeUrl(fallbackUrl);
     if (!canonicalLink) continue;
+    // Не подставляем Date.now() для неизвестных дат, чтобы старые публикации не всплывали вверх.
+    const publishedAt = firstDate(dateValue, Date.now() - (rawItems.length - index) * 1_000);
     items.push(
       normalizeItem({
         title: cleanTitle(itemTitle, "Без заголовка"),
         link: canonicalLink,
         guid: guid || canonicalLink,
-        publishedAt: firstDate(dateValue),
+        publishedAt,
         author,
         excerpt: normalizeText(rawDesc || content.text).slice(0, 400),
         contentHtml: content.html,
@@ -222,12 +261,16 @@ export function parseFeedXml(xml: string, fallbackUrl: string): ParsedFeed {
     siteUrl = fallbackUrl;
   }
 
+  const nextOlderPage = findOlderPageLink(doc, fallbackUrl);
+
   return {
     title,
     siteUrl,
     description,
     items,
     format: isAtom ? "atom" : "rss",
+    totalItems: items.length,
+    nextOlderPage,
   };
 }
 
@@ -285,7 +328,7 @@ export function articleDedupeKeys(article: Pick<Article, "guid" | "url" | "title
   return keys;
 }
 
-export function feedItemToArticle(item: ParsedFeedItem, source: Source): Article {
+export function feedItemToArticle(item: ParsedFeedItem, source: Source, feedOrder = 0): Article {
   const canonical = canonicalizeUrl(item.link);
   const contentText = item.contentText || stripHtml(item.contentHtml);
   const count = charCount(contentText);
@@ -309,32 +352,40 @@ export function feedItemToArticle(item: ParsedFeedItem, source: Source): Article
         ? undefined
         : "В RSS передан только краткий фрагмент. Нажмите «Извлечь полный текст», чтобы загрузить статью с сайта.",
     charCount: count,
+    readAt: null,
+    savedAt: null,
+    feedOrder,
   };
 }
 
-export async function syncSourceFeed(
-  source: Source,
-  existingArticles: Article[]
-): Promise<{
+export interface SyncFeedResult {
   articles: Article[];
   feedTitle?: string;
   notModified: boolean;
   total: number;
   etag?: string;
   lastModified?: string;
-}> {
+  nextOlderPage: string | null;
+}
+
+export async function syncSourceFeed(
+  source: Source,
+  existingArticles: Article[]
+): Promise<SyncFeedResult> {
   const result = await fetchFeedXml(source.url, {
     etag: source.etag,
     lastModified: source.lastModified,
   });
   if (result.notModified) {
-    return { articles: [], notModified: true, total: 0 };
+    return { articles: [], notModified: true, total: 0, nextOlderPage: null };
   }
   const feed = parseFeedXml(result.xml, source.url);
   const existingKeys = new Set(existingArticles.flatMap((article) => articleDedupeKeys(article)));
   const added: Article[] = [];
-  for (const item of feed.items.slice(0, 80)) {
-    const article = feedItemToArticle(item, source);
+  for (let i = 0; i < feed.items.length; i += 1) {
+    if (i >= FEED_FETCH_MAX_ITEMS) break;
+    const item = feed.items[i];
+    const article = feedItemToArticle(item, source, i);
     const keys = articleDedupeKeys(article);
     if (keys.some((key) => existingKeys.has(key))) continue;
     keys.forEach((key) => existingKeys.add(key));
@@ -344,9 +395,76 @@ export async function syncSourceFeed(
     articles: added,
     feedTitle: feed.title,
     notModified: false,
-    total: feed.items.length,
+    total: feed.totalItems,
     etag: result.etag,
     lastModified: result.lastModified,
+    nextOlderPage: feed.nextOlderPage,
+  };
+}
+
+/**
+ * Загружает более старую страницу ленты, если издатель сообщает о пагинации.
+ * Защищается от повторов и циклических ссылок.
+ */
+export async function syncOlderPages(
+  source: Source,
+  existingArticles: Article[],
+  visitedUrls: Set<string>
+): Promise<{
+  articles: Article[];
+  pagesFetched: number;
+  nextOlderPage: string | null;
+  finished: boolean;
+}> {
+  const added: Article[] = [];
+  let currentUrl = source.nextOlderPage || null;
+  let pagesFetched = 0;
+  const existingKeys = new Set(existingArticles.flatMap((article) => articleDedupeKeys(article)));
+
+  while (currentUrl && pagesFetched < FEED_OLDER_PAGES_LIMIT) {
+    if (visitedUrls.has(currentUrl)) break;
+    visitedUrls.add(currentUrl);
+
+    let result: FetchXmlResult;
+    try {
+      result = await fetchFeedXml(currentUrl);
+    } catch (error) {
+      if (error instanceof FeedError && error.code === "http") {
+        break;
+      }
+      throw error;
+    }
+
+    let feed: ParsedFeed;
+    try {
+      feed = parseFeedXml(result.xml, currentUrl);
+    } catch {
+      break;
+    }
+
+    let newOnPage = 0;
+    for (let i = 0; i < feed.items.length; i += 1) {
+      if (i >= FEED_FETCH_MAX_ITEMS) break;
+      const item = feed.items[i];
+      const article = feedItemToArticle(item, source, existingArticles.length + added.length + i);
+      const keys = articleDedupeKeys(article);
+      if (keys.some((key) => existingKeys.has(key))) continue;
+      keys.forEach((key) => existingKeys.add(key));
+      added.push(article);
+      newOnPage += 1;
+    }
+
+    pagesFetched += 1;
+    currentUrl = feed.nextOlderPage;
+
+    if (newOnPage === 0 && added.length === 0) break;
+  }
+
+  return {
+    articles: added,
+    pagesFetched,
+    nextOlderPage: currentUrl,
+    finished: !currentUrl || visitedUrls.has(currentUrl),
   };
 }
 

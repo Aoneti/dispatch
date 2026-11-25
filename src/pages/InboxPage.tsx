@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  ArrowUpDown,
+  CheckCheck,
   ExternalLink,
   FileSearch,
   FileText,
@@ -46,6 +48,9 @@ import {
 
 const INITIAL_BATCH = 50;
 
+type FeedView = "all" | "unread" | "read" | "saved";
+type SortOrder = "newest" | "oldest";
+
 interface InboxProps {
   selectedId: string | null;
   onSelect: (id: string | null) => void;
@@ -56,7 +61,7 @@ interface InboxProps {
 
 type GenerationFeedback =
   | { kind: "insufficient"; articleId: string; format: DraftFormat; warnings: string[] }
-  | { kind: "error"; articleId: string; format: DraftFormat; message: string; technical?: string };
+  | { kind: "error"; articleId: string; format: DraftFormat; message: string; technical?: string; retryAfterMs?: number };
 
 export function InboxPage({
   selectedId,
@@ -65,9 +70,19 @@ export function InboxPage({
   onOpenDraft,
   onOpenSettings,
 }: InboxProps) {
-  const { articles, sources, drafts, refreshAll, isRefreshingAll } = useStore();
+  const {
+    articles,
+    sources,
+    drafts,
+    refreshAll,
+    isRefreshingAll,
+    markAllReadInView,
+    markAllReadInSource,
+  } = useStore();
   const [search, setSearch] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
+  const [view, setView] = useState<FeedView>("all");
+  const [sortOrder, setSortOrder] = useState<SortOrder>("newest");
   const [visibleLimit, setVisibleLimit] = useState(INITIAL_BATCH);
 
   const draftsMap = useMemo(() => {
@@ -83,18 +98,33 @@ export function InboxPage({
 
   const filtered = useMemo(() => {
     const query = search.trim().toLocaleLowerCase("ru");
-    return [...articles]
-      .filter((article) => {
-        if (sourceFilter !== "all" && article.sourceId !== sourceFilter) return false;
-        if (query && !article.title.toLocaleLowerCase("ru").includes(query)) return false;
-        return true;
-      })
-      .sort((a, b) => b.publishedAt - a.publishedAt);
-  }, [articles, search, sourceFilter]);
+    const matches = articles.filter((article) => {
+      if (view === "unread" && article.readAt !== null) return false;
+      if (view === "read" && article.readAt === null) return false;
+      if (view === "saved" && article.savedAt === null) return false;
+      if (sourceFilter !== "all" && article.sourceId !== sourceFilter) return false;
+      if (query) {
+        const haystack = [
+          article.title,
+          article.excerpt,
+          article.contentText,
+          article.author,
+          article.sourceName,
+        ]
+          .join(" ")
+          .toLocaleLowerCase("ru");
+        if (!haystack.includes(query)) return false;
+      }
+      return true;
+    });
+    return [...matches].sort((a, b) =>
+      sortOrder === "newest" ? b.publishedAt - a.publishedAt : a.publishedAt - b.publishedAt
+    );
+  }, [articles, search, sourceFilter, view, sortOrder]);
 
   useEffect(() => {
     setVisibleLimit(INITIAL_BATCH);
-  }, [search, sourceFilter]);
+  }, [search, sourceFilter, view, sortOrder]);
 
   const selected = useMemo(
     () => (selectedId ? articles.find((article) => article.id === selectedId) || null : null),
@@ -112,6 +142,18 @@ export function InboxPage({
     }
     return Array.from(map.entries());
   }, [visible]);
+
+  const unreadCount = useMemo(() => articles.filter((a) => a.readAt === null).length, [articles]);
+  const readCount = useMemo(() => articles.filter((a) => a.readAt !== null).length, [articles]);
+  const savedCount = useMemo(() => articles.filter((a) => a.savedAt !== null).length, [articles]);
+  const allCount = articles.length;
+  const sourceUnreadCount = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const a of articles) {
+      if (a.readAt === null) map.set(a.sourceId, (map.get(a.sourceId) || 0) + 1);
+    }
+    return map;
+  }, [articles]);
 
   const hasSources = sources.length > 0;
   const hasEnabledSources = sources.some((source) => source.enabled);
@@ -136,10 +178,10 @@ export function InboxPage({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* Панель поиска и обновления (на узкой боковой панели скрывается при открытии статьи) */}
-      <div className={cn("shrink-0 border-b border-line bg-paper px-3 py-3 sm:px-5", selected && "hidden md:block")}>
+      {/* Панель поиска и обновления */}
+      <div className="shrink-0 border-b border-line bg-paper px-3 py-3 sm:px-5">
         <div className="flex flex-wrap items-center gap-2">
-          <div className="relative min-w-[160px] flex-1 sm:max-w-[300px]">
+          <div className="relative min-w-[160px] flex-1 sm:max-w-[320px]">
             <Search
               size={14}
               className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint"
@@ -148,9 +190,9 @@ export function InboxPage({
               id="news-search"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="Поиск по заголовку…"
-              className="h-9 pl-8 pr-8 text-[12.5px]"
-              aria-label="Поиск новостей по заголовку"
+              placeholder="Поиск по заголовку, тексту, автору или источнику…"
+              className="h-9 pl-8 pr-8 text-[13px]"
+              aria-label="Поиск новостей"
             />
             {search && (
               <button
@@ -165,17 +207,18 @@ export function InboxPage({
           </div>
 
           {sources.length > 0 && (
-            <div className="w-full sm:w-[190px]">
+            <div className="w-full sm:w-[200px]">
               <Select
                 value={sourceFilter}
                 onChange={(event) => setSourceFilter(event.target.value)}
                 aria-label="Фильтр по источнику"
-                className="h-9 text-[12.5px]"
+                className="h-9 text-[13px]"
               >
-                <option value="all">Все источники ({articles.length})</option>
+                <option value="all">Все источники ({allCount})</option>
                 {sources.map((source) => (
                   <option key={source.id} value={source.id}>
                     {source.name}
+                    {sourceUnreadCount.get(source.id) ? ` (${sourceUnreadCount.get(source.id)})` : ""}
                   </option>
                 ))}
               </Select>
@@ -195,6 +238,74 @@ export function InboxPage({
             </Button>
           </div>
         </div>
+
+        {/* Вкладки представлений и массовые действия */}
+        <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2.5">
+          <div className="flex flex-wrap items-center gap-0.5" role="tablist" aria-label="Представления ленты">
+            {(
+              [
+                ["all", "Все", allCount],
+                ["unread", "Непрочитанные", unreadCount],
+                ["read", "Прочитанные", readCount],
+                ["saved", "Сохранённые", savedCount],
+              ] as Array<[FeedView, string, number]>
+            ).map(([value, label, count]) => (
+              <button
+                key={value}
+                type="button"
+                role="tab"
+                aria-selected={view === value}
+                onClick={() => setView(value)}
+                className={cn(
+                  "inline-flex h-8 items-center gap-1.5 rounded-[5px] px-2.5 text-[12.5px] font-medium transition-colors",
+                  view === value
+                    ? "bg-ink text-paper"
+                    : "text-muted hover:bg-surface hover:text-ink"
+                )}
+              >
+                {label}
+                <span className="font-mono text-[10.5px] leading-none">{count}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            {view === "unread" && filtered.length > 0 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() =>
+                  markAllReadInView(
+                    filtered.map((a) => a.id),
+                    "Отмечено прочитанным в текущем представлении"
+                  )
+                }
+                icon={<CheckCheck size={13} />}
+              >
+                Прочитать всё ({filtered.length})
+              </Button>
+            )}
+            {sourceFilter !== "all" && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => markAllReadInSource(sourceFilter)}
+                icon={<CheckCheck size={13} />}
+              >
+                Прочитать источник
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setSortOrder((prev) => (prev === "newest" ? "oldest" : "newest"))}
+              icon={<ArrowUpDown size={13} />}
+              title={sortOrder === "newest" ? "Сначала старые" : "Сначала новые"}
+            >
+              {sortOrder === "newest" ? "Сначала новые" : "Сначала старые"}
+            </Button>
+          </div>
+        </div>
       </div>
 
       {/* Лента новостей и область чтения */}
@@ -210,16 +321,16 @@ export function InboxPage({
             {visible.length === 0 ? (
               <EmptyState
                 compact
-                icon={search || sourceFilter !== "all" ? <Search size={19} /> : <Newspaper size={19} />}
-                title={
-                  articles.length === 0 ? "Статей пока нет" : "Ничего не найдено"
-                }
+                icon={search || sourceFilter !== "all" || view !== "all" ? <Search size={19} /> : <Newspaper size={19} />}
+                title={articles.length === 0 ? "Статей пока нет" : "Ничего не найдено"}
                 description={
                   articles.length === 0
                     ? hasEnabledSources
                       ? "Нажмите «Обновить», чтобы загрузить свежие публикации из подключённых RSS-лент."
                       : "Все источники сейчас отключены. Включите нужную ленту в разделе «Источники»."
-                    : "Попробуйте другой запрос или сбросьте фильтр по источнику."
+                    : view === "saved"
+                      ? "Сохранённых публикаций пока нет. Нажмите на значок закладки в любой новости."
+                      : "Попробуйте другой запрос, представление или сбросьте фильтры."
                 }
                 action={
                   articles.length === 0 ? (
@@ -241,9 +352,10 @@ export function InboxPage({
                       onClick={() => {
                         setSearch("");
                         setSourceFilter("all");
+                        setView("all");
                       }}
                     >
-                      Сбросить фильтр
+                      Сбросить фильтры
                     </Button>
                   )
                 }
@@ -253,45 +365,73 @@ export function InboxPage({
                 {grouped.map(([dayLabel, items]) => (
                   <div key={dayLabel}>
                     <div className="sticky top-0 z-10 flex items-center justify-between border-b border-line bg-paper/95 px-4 py-1.5 backdrop-blur">
-                      <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-faint">
+                      <span className="font-mono text-[11px] uppercase tracking-[0.08em] text-faint">
                         {dayLabel}
                       </span>
-                      <span className="font-mono text-[10px] text-faint">{items.length}</span>
+                      <span className="font-mono text-[11px] text-faint">{items.length}</span>
                     </div>
                     {items.map((article) => {
                       const active = selected?.id === article.id;
                       const linked = draftsMap.get(article.id);
+                      const isUnread = article.readAt === null;
+                      const isSaved = article.savedAt !== null;
                       return (
                         <button
                           key={article.id}
                           type="button"
                           onClick={() => onSelect(article.id)}
                           aria-pressed={active}
+                          aria-label={`${isUnread ? "Непрочитанная. " : ""}${article.title}`}
                           className={cn(
                             "block w-full border-b border-line px-4 py-3 text-left transition-colors",
                             active ? "bg-surface shadow-inset-line" : "hover:bg-surface/65"
                           )}
                         >
-                          <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
+                          <div className="flex items-center justify-between gap-2 text-[11.5px] text-muted">
                             <span className="truncate font-medium">{article.sourceName}</span>
-                            <span className="shrink-0 font-mono text-[10px] text-faint">
+                            <span className="shrink-0 font-mono text-[10.5px] text-faint">
                               {formatTime(article.publishedAt)}
                             </span>
                           </div>
-                          <h3 className="mt-1 font-serif text-[15px] font-semibold leading-[1.35] text-ink">
-                            {article.title}
-                          </h3>
+                          <div className="mt-1 flex items-start gap-1.5">
+                            {isUnread && (
+                              <span
+                                className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+                                aria-hidden
+                                title="Непрочитанная"
+                              />
+                            )}
+                            <h3
+                              className={cn(
+                                "min-w-0 flex-1 font-serif text-[15.5px] leading-[1.32] text-ink",
+                                isUnread ? "font-semibold" : "font-medium text-ink-soft"
+                              )}
+                            >
+                              {article.title}
+                            </h3>
+                          </div>
                           {article.excerpt && (
                             <p className="mt-1 line-clamp-2 text-[12px] leading-[1.5] text-muted">
                               {article.excerpt}
                             </p>
                           )}
-                          {(linked?.short || linked?.long) && (
-                            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                              {linked.short && <Badge tone="moss">Короткий пост</Badge>}
-                              {linked.long && <Badge tone="blue">Расширенный пост</Badge>}
-                            </div>
-                          )}
+                          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                            {isSaved && (
+                              <Badge tone="blue" className="h-[18px] px-1 text-[10px]">
+                                Сохранена
+                              </Badge>
+                            )}
+                            {linked?.short && (
+                              <Badge tone="moss" className="h-[18px] px-1 text-[10px]">
+                                Короткий пост
+                              </Badge>
+                            )}
+                            {linked?.long && (
+                              <Badge tone="blue" className="h-[18px] px-1 text-[10px]">
+                                Расширенный пост
+                              </Badge>
+                            )}
+                          </div>
                         </button>
                       );
                     })}
@@ -345,7 +485,10 @@ function ArticleReader({
     saveGeneratedDraft,
     updateArticleExtraction,
     deleteArticle,
+    markRead,
+    toggleSaved,
     notify,
+    recordGeminiUsage,
   } = useStore();
 
   const [extracting, setExtracting] = useState(false);
@@ -359,7 +502,15 @@ function ArticleReader({
   const [replaceTarget, setReplaceTarget] = useState<{ format: DraftFormat; draft: Draft } | null>(null);
   const [feedback, setFeedback] = useState<GenerationFeedback | null>(null);
 
-  // Очищаем сообщение об ошибке при переходе к другой статье. Запросы в useEffect запрещены.
+  // Автоматическое прочтение при реальном открытии статьи.
+  useEffect(() => {
+    if (!article || article.readAt !== null || !settings.autoMarkRead) return;
+    const timer = window.setTimeout(() => {
+      markRead(article.id, true);
+    }, 1_000);
+    return () => window.clearTimeout(timer);
+  }, [article?.id, article?.readAt, settings.autoMarkRead, markRead]);
+
   useEffect(() => {
     setFeedback((prev) => (prev && article && prev.articleId === article.id ? prev : null));
   }, [article]);
@@ -469,12 +620,14 @@ function ArticleReader({
         format,
         message: error.message,
         technical: error.technical,
+        retryAfterMs: error.retryAfterMs,
       });
       notify({
         title: format === "short" ? "Ошибка генерации короткого поста" : "Ошибка генерации расширенного поста",
         description: error.message,
         variant: "error",
       });
+      recordGeminiUsage({ error: true, kind: error.kind });
     } finally {
       inFlightRef.current = false;
       setGenerating(null);
@@ -572,6 +725,8 @@ function ArticleReader({
   };
 
   const activeFeedback = feedback && feedback.articleId === article.id ? feedback : null;
+  const isUnread = article.readAt === null;
+  const isSaved = article.savedAt !== null;
 
   return (
     <section
@@ -583,7 +738,7 @@ function ArticleReader({
         <button
           type="button"
           onClick={onBack}
-          className="inline-flex h-7 items-center gap-1 rounded-[5px] px-1.5 text-[12px] font-medium text-muted hover:bg-surface-2 hover:text-ink md:hidden"
+          className="inline-flex h-8 items-center gap-1 rounded-[5px] px-1.5 text-[12px] font-medium text-muted hover:bg-surface-2 hover:text-ink md:hidden"
         >
           <ArrowLeft size={14} /> К списку
         </button>
@@ -594,24 +749,41 @@ function ArticleReader({
           <span>{formatDate(article.publishedAt)}</span>
         </span>
 
-        <a
-          href={article.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex h-7 items-center gap-1 rounded-[5px] border border-line bg-surface px-2 text-[11.5px] font-medium text-ink-soft transition-colors hover:border-line-strong hover:text-ink"
-        >
-          <ExternalLink size={12} />
-          <span className="hidden sm:inline">Оригинал</span>
-        </a>
-
-        <IconButton
-          label="Удалить статью"
-          size="sm"
-          onClick={() => setDeleteOpen(true)}
-          className="hover:text-rose"
-        >
-          <Trash2 size={14} />
-        </IconButton>
+        <div className="flex items-center gap-1">
+          <IconButton
+            label={isUnread ? "Отметить прочитанной" : "Вернуть в непрочитанные"}
+            size="sm"
+            onClick={() => markRead(article.id, !isUnread)}
+            className={isUnread ? "text-amber" : "text-moss"}
+          >
+            <CheckCheck size={14} />
+          </IconButton>
+          <IconButton
+            label={isSaved ? "Убрать из сохранённых" : "Сохранить новость"}
+            size="sm"
+            onClick={() => toggleSaved(article.id)}
+            className={isSaved ? "text-blue" : ""}
+          >
+            <FileText size={14} fill={isSaved ? "currentColor" : "none"} />
+          </IconButton>
+          <a
+            href={article.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex h-8 items-center gap-1 rounded-[5px] border border-line bg-surface px-2 text-[11.5px] font-medium text-ink-soft transition-colors hover:border-line-strong hover:text-ink"
+          >
+            <ExternalLink size={12} />
+            <span className="hidden sm:inline">Оригинал</span>
+          </a>
+          <IconButton
+            label="Удалить статью"
+            size="sm"
+            onClick={() => setDeleteOpen(true)}
+            className="hover:text-rose"
+          >
+            <Trash2 size={14} />
+          </IconButton>
+        </div>
       </div>
 
       {/* Тело статьи */}
@@ -628,6 +800,8 @@ function ArticleReader({
                 <span>{article.author}</span>
               </>
             )}
+            {isUnread && <Badge tone="amber" className="h-[18px] px-1 text-[10px]">Непрочитанная</Badge>}
+            {isSaved && <Badge tone="blue" className="h-[18px] px-1 text-[10px]">Сохранена</Badge>}
           </div>
 
           <h1 className="mt-3 font-serif text-[24px] font-semibold leading-[1.22] tracking-[-0.015em] text-ink sm:text-[28px]">
@@ -730,6 +904,12 @@ function ArticleReader({
                   <p className="mt-1 text-[12px] leading-relaxed text-ink-soft">
                     {activeFeedback.message}
                   </p>
+                  {activeFeedback.retryAfterMs && (
+                    <p className="mt-1 text-[11px] text-muted">
+                      Google рекомендует повторить через{" "}
+                      {Math.max(1, Math.ceil(activeFeedback.retryAfterMs / 1000))} сек.
+                    </p>
+                  )}
                   {activeFeedback.technical && (
                     <p className="mt-1.5 font-mono text-[10.5px] text-muted">
                       Код ответа: {activeFeedback.technical}

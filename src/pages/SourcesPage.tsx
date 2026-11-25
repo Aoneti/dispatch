@@ -37,12 +37,14 @@ export function SourcesPage({ onAddSource, onEditSource }: SourcesProps) {
     syncingIds,
     toggleSource,
     deleteSource,
+    loadOlderArticles,
     notify,
   } = useStore();
   const [deleteTarget, setDeleteTarget] = useState<Source | null>(null);
   const [removeArticles, setRemoveArticles] = useState(true);
 
   const countFor = (id: string) => articles.filter((article) => article.sourceId === id).length;
+  const unreadFor = (id: string) => articles.filter((article) => article.sourceId === id && article.readAt === null).length;
   const hasEnabled = sources.some((source) => source.enabled);
 
   const handleToggle = (source: Source) => {
@@ -103,6 +105,7 @@ export function SourcesPage({ onAddSource, onEditSource }: SourcesProps) {
         <div className="mt-5 overflow-hidden rounded-[8px] border border-line bg-surface shadow-card">
           {sources.map((source) => {
             const count = countFor(source.id);
+            const unread = unreadFor(source.id);
             const syncing = syncingIds.includes(source.id) || source.status === "syncing";
             return (
               <div
@@ -161,6 +164,18 @@ export function SourcesPage({ onAddSource, onEditSource }: SourcesProps) {
                       </a>
                       <span className="text-line-strong">·</span>
                       <span>{pluralRu(count, "статья", "статьи", "статей")}</span>
+                      {source.feedItemCount !== undefined && (
+                        <>
+                          <span className="text-line-strong">·</span>
+                          <span>В ленте: {source.feedItemCount}</span>
+                        </>
+                      )}
+                      {unread > 0 && (
+                        <>
+                          <span className="text-line-strong">·</span>
+                          <span className="text-accent">{pluralRu(unread, "непрочитанная", "непрочитанные", "непрочитанных")}</span>
+                        </>
+                      )}
                       {source.lastSyncAt && (
                         <>
                           <span className="text-line-strong">·</span>
@@ -171,6 +186,16 @@ export function SourcesPage({ onAddSource, onEditSource }: SourcesProps) {
                   </div>
 
                   <div className="ml-auto flex shrink-0 items-center gap-1">
+                    {source.nextOlderPage && (
+                      <IconButton
+                        label={`Загрузить более старые публикации «${source.name}»`}
+                        size="sm"
+                        disabled={syncing}
+                        onClick={() => void loadOlderArticles(source.id)}
+                      >
+                        <Plus size={14} />
+                      </IconButton>
+                    )}
                     <Toggle
                       checked={source.enabled}
                       onChange={() => handleToggle(source)}

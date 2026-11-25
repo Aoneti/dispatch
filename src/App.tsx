@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { PageKey, Source } from "./lib/types";
 import { DEFAULT_SYNC_MINUTES } from "./lib/types";
-import { StoreProvider, useStore } from "./lib/store";
+import { pushUnreadCountToBadge, StoreProvider, useStore } from "./lib/store";
 import { cn } from "./lib/utils";
 import { BottomNav, Sidebar, Topbar } from "./components/shell";
 import { SourceDialog } from "./components/SourceDialog";
@@ -12,7 +12,7 @@ import { DraftsPage } from "./pages/DraftsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
 function Workspace() {
-  const { refreshAll } = useStore();
+  const { refreshAll, purgeOldArticles, settings, articles } = useStore();
   const [page, setPage] = useState<PageKey>("inbox");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
@@ -97,6 +97,20 @@ function Workspace() {
       })
       .catch(() => undefined);
   }, [refreshAll]);
+
+  // Автоматическая очистка старых прочитанных статей только при включении пользователем.
+  useEffect(() => {
+    if (!settings.autoCleanupEnabled) return;
+    const interval = window.setInterval(() => {
+      purgeOldArticles();
+    }, 86_400_000);
+    return () => window.clearInterval(interval);
+  }, [purgeOldArticles, settings.autoCleanupEnabled]);
+
+  // Уведомление фонового скрипта об обновлении счётчика непрочитанных.
+  useEffect(() => {
+    pushUnreadCountToBadge(articles);
+  }, [articles]);
 
   const splitLayout = page === "inbox" || page === "drafts";
 

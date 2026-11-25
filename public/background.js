@@ -38,11 +38,6 @@ async function notifyOpenPanel() {
 async function markSyncDue() {
   try {
     await chrome.storage.local.set({ dispatchSyncDueAt: Date.now() });
-    if (chrome.action) {
-      await chrome.action.setBadgeBackgroundColor({ color: BADGE_COLOR });
-      await chrome.action.setBadgeText({ text: "•" });
-      await chrome.action.setTitle({ title: "Dispatch — доступно обновление лент" });
-    }
   } catch {
     // Значок необязателен.
   }
@@ -52,13 +47,37 @@ async function markSyncDue() {
 async function clearSyncDue() {
   try {
     await chrome.storage.local.set({ dispatchSyncDueAt: 0 });
-    if (chrome.action) {
-      await chrome.action.setBadgeText({ text: "" });
-      await chrome.action.setTitle({ title: "Открыть Dispatch" });
-    }
   } catch {
     // Значок необязателен.
   }
+}
+
+async function updateUnreadBadge(count) {
+  try {
+    if (!chrome.action) return;
+    const text = count > 0 ? (count > 99 ? "99+" : String(count)) : "";
+    await chrome.action.setBadgeBackgroundColor({ color: BADGE_COLOR });
+    await chrome.action.setBadgeText({ text });
+    await chrome.action.setTitle({
+      title: count > 0 ? `Dispatch — ${count} непрочитанных` : "Открыть Dispatch",
+    });
+  } catch {
+    // Значок необязателен.
+  }
+}
+
+async function readUnreadCount() {
+  try {
+    const res = await chrome.storage.local.get("dispatchUnreadCount");
+    return typeof res.dispatchUnreadCount === "number" ? res.dispatchUnreadCount : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function updateUnreadBadgeFromStorage() {
+  const count = await readUnreadCount();
+  await updateUnreadBadge(count);
 }
 
 function enableSidePanel() {
@@ -91,10 +110,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "dispatch:sync-complete") {
-    void clearSyncDue().then(() => sendResponse({ ok: true }));
+    void clearSyncDue().then(() => updateUnreadBadgeFromStorage().then(() => sendResponse({ ok: true })));
+    return true;
+  }
+  if (message?.type === "dispatch:unread-count") {
+    void updateUnreadBadge(message?.count ?? 0).then(() => sendResponse({ ok: true }));
     return true;
   }
   return false;
+});
+
+// Восстанавливаем значок при старте браузера.
+chrome.runtime.onStartup.addListener(() => {
+  void updateUnreadBadgeFromStorage();
 });
 
 enableSidePanel();

@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Dispatch — RSS в X",
   "short_name": "Dispatch",
-  "version": "2.0.0",
-  "description": "Локальное расширение Chrome для чтения RSS/Atom-лент и ручной подготовки постов для X с помощью Google Gemini.",
+  "version": "2.1.0",
+  "description": "Локальное расширение Chrome для чтения RSS/Atom-лент и ручной подготовки постов для X с помощью Google Gemini или Groq.",
   "minimum_chrome_version": "116",
   "action": {
     "default_title": "Открыть Dispatch",
@@ -29,7 +29,8 @@
   },
   "permissions": ["storage", "alarms", "sidePanel"],
   "host_permissions": [
-    "https://generativelanguage.googleapis.com/*"
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.groq.com/*"
   ],
   "optional_host_permissions": [
     "https://*/*",

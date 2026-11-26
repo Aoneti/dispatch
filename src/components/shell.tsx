@@ -11,7 +11,7 @@ import {
   X,
 } from "lucide-react";
 import type { PageKey } from "../lib/types";
-import { GEMINI_MODEL } from "../lib/types";
+import { AI_PROVIDER_LABELS, GEMINI_MODEL } from "../lib/types";
 import { cn, formatRelative, pluralRu } from "../lib/utils";
 import { useStore } from "../lib/store";
 import { IconButton, StatusDot } from "./ui";
@@ -118,36 +118,59 @@ function SidebarContent({
       </nav>
 
       <div className="shrink-0 border-t border-line p-2.5">
-        <button
-          type="button"
-          onClick={() => go("settings")}
-          className={cn(
-            "flex w-full items-center gap-2.5 rounded-[6px] border px-2.5 py-2 text-left transition-colors",
-            settings.apiKey
-              ? "border-line bg-surface hover:border-line-strong"
-              : "border-accent/25 bg-accent-soft/60 hover:bg-accent-soft"
-          )}
-        >
-          <span
-            className={cn(
-              "flex h-6 w-6 shrink-0 items-center justify-center rounded-[4px] border",
-              settings.apiKey
-                ? "border-moss/25 bg-moss-soft text-moss"
-                : "border-accent/25 bg-surface text-accent"
-            )}
-          >
-            <KeyRound size={12} />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-[11.5px] font-medium text-ink">
-              {settings.apiKey ? "Gemini подключён" : "Укажите API-ключ"}
-            </span>
-            <span className="mt-0.5 block truncate font-mono text-[9px] text-muted">
-              {GEMINI_MODEL}
-            </span>
-          </span>
-          <StatusDot tone={settings.apiKey ? "ok" : "idle"} />
-        </button>
+        {(() => {
+          const activeProvider = settings.activeProvider;
+          const isGroq = activeProvider === "groq";
+          const providerLabel = AI_PROVIDER_LABELS[activeProvider];
+          const activeModel = isGroq ? settings.groqModel : GEMINI_MODEL;
+          const hasKey = Boolean(isGroq ? settings.groqApiKey : settings.apiKey);
+          const isVerified = isGroq
+            ? hasKey &&
+              settings.groqLastTestedAt !== null &&
+              settings.groqTestedModel === settings.groqModel
+            : hasKey && settings.lastTestedAt !== null;
+          const statusTitle = isVerified
+            ? `${providerLabel} · подключён`
+            : hasKey
+              ? `${providerLabel} · ключ сохранён`
+              : `${providerLabel}: укажите ключ`;
+          const dotTone = isVerified ? "ok" : hasKey ? "syncing" : "idle";
+
+          return (
+            <button
+              type="button"
+              onClick={() => go("settings")}
+              className={cn(
+                "flex w-full items-center gap-2.5 rounded-[6px] border px-2.5 py-2 text-left transition-colors",
+                hasKey
+                  ? "border-line bg-surface hover:border-line-strong"
+                  : "border-accent/25 bg-accent-soft/60 hover:bg-accent-soft"
+              )}
+            >
+              <span
+                className={cn(
+                  "flex h-6 w-6 shrink-0 items-center justify-center rounded-[4px] border",
+                  isVerified
+                    ? "border-moss/25 bg-moss-soft text-moss"
+                    : hasKey
+                      ? "border-amber/25 bg-amber-soft text-amber"
+                      : "border-accent/25 bg-surface text-accent"
+                )}
+              >
+                <KeyRound size={12} />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[11.5px] font-medium text-ink">
+                  {statusTitle}
+                </span>
+                <span className="mt-0.5 block truncate font-mono text-[9.5px] text-muted">
+                  {activeModel}
+                </span>
+              </span>
+              <StatusDot tone={dotTone} />
+            </button>
+          );
+        })()}
       </div>
     </div>
   );

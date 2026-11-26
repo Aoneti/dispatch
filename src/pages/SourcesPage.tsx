@@ -183,6 +183,11 @@ export function SourcesPage({ onAddSource, onEditSource }: SourcesProps) {
                         </>
                       )}
                     </div>
+                    {source.enabled && source.status === "ok" && source.feedItemCount !== undefined && !source.nextOlderPage && (
+                      <p className="mt-1 text-[10.5px] text-faint">
+                        Издатель отдаёт в ленту последние {pluralRu(source.feedItemCount, "публикацию", "публикации", "публикаций")}; доступ к более ранним публикациям через эту ленту не предоставлен.
+                      </p>
+                    )}
                   </div>
 
                   <div className="ml-auto flex shrink-0 items-center gap-1">

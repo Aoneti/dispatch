@@ -19,6 +19,8 @@ import { createEmptyWorkspace } from "./seed";
 import { readWorkspaceRecord, writeWorkspaceRecord } from "./db";
 import { ensureHostAccess } from "./permissions";
 import type {
+  AIProvider,
+  AIUsageStats,
   Article,
   Draft,
   DraftFormat,
@@ -34,9 +36,12 @@ import type {
   WorkspaceData,
 } from "./types";
 import {
+  AI_PROVIDER_LABELS,
+  DEFAULT_GROQ_MODEL,
   DEFAULT_SETTINGS,
   FEED_CONCURRENCY,
   GEMINI_MODEL,
+  isValidGroqModel,
   LEGACY_SEED_ARTICLE_IDS,
   LEGACY_SEED_DRAFT_IDS,
   LEGACY_SEED_SOURCE_IDS,
@@ -46,15 +51,12 @@ import { charCount, pluralRu, sanitizeHtml, uid } from "./utils";
 
 const WORKSPACE_KEY = "dispatch.workspace.v1";
 const WORKSPACE_SAVED_AT_KEY = "dispatch.workspace.savedAt.v1";
-const API_KEY_STORAGE = "dispatch.gemini.key.v1";
 
-function loadApiKey(): string {
-  try {
-    return localStorage.getItem(API_KEY_STORAGE) || "";
-  } catch {
-    return "";
-  }
-}
+const GEMINI_API_KEY_STORAGE = "dispatch.gemini.key.v1";
+const GEMINI_CHROME_STORAGE_KEY = "dispatchGeminiKeyV1";
+
+const GROQ_API_KEY_STORAGE = "dispatch.groq.key.v1";
+const GROQ_CHROME_STORAGE_KEY = "dispatchGroqKeyV1";
 
 type ChromeLocalStorage = {
   get: (keys: string | string[]) => Promise<Record<string, unknown>>;
@@ -67,10 +69,18 @@ function extensionStorage(): ChromeLocalStorage | null {
   return chromeApi?.storage?.local ?? null;
 }
 
-function persistApiKey(key: string) {
+function loadGeminiApiKey(): string {
   try {
-    if (key) localStorage.setItem(API_KEY_STORAGE, key);
-    else localStorage.removeItem(API_KEY_STORAGE);
+    return localStorage.getItem(GEMINI_API_KEY_STORAGE) || "";
+  } catch {
+    return "";
+  }
+}
+
+function persistGeminiApiKey(key: string) {
+  try {
+    if (key) localStorage.setItem(GEMINI_API_KEY_STORAGE, key);
+    else localStorage.removeItem(GEMINI_API_KEY_STORAGE);
   } catch {
     // Если localStorage недоступен, ключ останется в памяти до закрытия вкладки.
   }
@@ -78,11 +88,42 @@ function persistApiKey(key: string) {
     const local = extensionStorage();
     if (local) {
       if (key) {
-        void local.set({ dispatchGeminiKeyV1: key }).catch(() => undefined);
+        void local.set({ [GEMINI_CHROME_STORAGE_KEY]: key }).catch(() => undefined);
       } else if (local.remove) {
-        void local.remove("dispatchGeminiKeyV1").catch(() => undefined);
+        void local.remove(GEMINI_CHROME_STORAGE_KEY).catch(() => undefined);
       } else {
-        void local.set({ dispatchGeminiKeyV1: "" }).catch(() => undefined);
+        void local.set({ [GEMINI_CHROME_STORAGE_KEY]: "" }).catch(() => undefined);
+      }
+    }
+  } catch {
+    // Вне расширения chrome.storage.local отсутствует.
+  }
+}
+
+function loadGroqApiKey(): string {
+  try {
+    return localStorage.getItem(GROQ_API_KEY_STORAGE) || "";
+  } catch {
+    return "";
+  }
+}
+
+function persistGroqApiKey(key: string) {
+  try {
+    if (key) localStorage.setItem(GROQ_API_KEY_STORAGE, key);
+    else localStorage.removeItem(GROQ_API_KEY_STORAGE);
+  } catch {
+    // Если localStorage недоступен, ключ останется в памяти до закрытия вкладки.
+  }
+  try {
+    const local = extensionStorage();
+    if (local) {
+      if (key) {
+        void local.set({ [GROQ_CHROME_STORAGE_KEY]: key }).catch(() => undefined);
+      } else if (local.remove) {
+        void local.remove(GROQ_CHROME_STORAGE_KEY).catch(() => undefined);
+      } else {
+        void local.set({ [GROQ_CHROME_STORAGE_KEY]: "" }).catch(() => undefined);
       }
     }
   } catch {
@@ -129,6 +170,27 @@ function normalizeExtraction(raw: unknown): ExtractionStatus {
 function normalizeTheme(raw: unknown): ThemeMode {
   if (raw === "light" || raw === "dark" || raw === "system") return raw;
   return "light";
+}
+
+function normalizeProvider(raw: unknown): AIProvider {
+  if (raw === "groq" || raw === "gemini") return raw;
+  return "gemini";
+}
+
+function normalizeUsageStats(raw: unknown): AIUsageStats {
+  const obj = isRecord(raw) ? raw : {};
+  return {
+    requests: Number(obj.requests) || 0,
+    successful: Number(obj.successful) || 0,
+    errors: Number(obj.errors) || 0,
+    inputTokens: Number(obj.inputTokens) || 0,
+    outputTokens: Number(obj.outputTokens) || 0,
+    totalTokens: Number(obj.totalTokens) || 0,
+    lastRequestAt: typeof obj.lastRequestAt === "number" ? obj.lastRequestAt : null,
+    lastErrorAt: typeof obj.lastErrorAt === "number" ? obj.lastErrorAt : null,
+    lastErrorKind: typeof obj.lastErrorKind === "string" ? obj.lastErrorKind : null,
+    lastErrorDetail: typeof obj.lastErrorDetail === "string" ? obj.lastErrorDetail : null,
+  };
 }
 
 /**
@@ -248,6 +310,13 @@ export function migrateWorkspaceData(
       continue;
     }
 
+    // Старые черновики были созданы через Google Gemini — сохраняем обратную совместимость.
+    const draftProvider: AIProvider =
+      item.provider === "groq" || item.provider === "gemini" ? item.provider : "gemini";
+    if (item.provider !== "groq" && item.provider !== "gemini") {
+      migrated = true;
+    }
+
     const base = {
       articleId,
       articleTitle: item.articleTitle,
@@ -255,6 +324,7 @@ export function migrateWorkspaceData(
       sourceUrl: typeof item.sourceUrl === "string" ? item.sourceUrl : "",
       createdAt: typeof item.createdAt === "number" ? item.createdAt : Date.now(),
       updatedAt: typeof item.updatedAt === "number" ? item.updatedAt : Date.now(),
+      provider: draftProvider,
       model: typeof item.model === "string" && item.model.trim() ? item.model.trim() : GEMINI_MODEL,
       warnings: asStringArray(item.warnings, 8),
       keyFacts: asStringArray(item.keyFacts, 8),
@@ -262,7 +332,7 @@ export function migrateWorkspaceData(
       status: normalizeStatus(item.status),
     };
 
-    // Новый формат v2 (один формат на запись).
+    // Формат один пост на запись (v2+).
     if ((item.format === "short" || item.format === "long") && typeof item.text === "string") {
       if (draftIds.has(item.id)) continue;
       draftIds.add(item.id);
@@ -318,28 +388,35 @@ export function migrateWorkspaceData(
   }
 
   const rawSettings = isRecord(raw.settings) ? raw.settings : {};
-  const rawUsage = isRecord(rawSettings.geminiUsage) ? rawSettings.geminiUsage : {};
   const settings: Settings = {
-    apiKey: options.preserveApiKey !== false ? loadApiKey() : "",
+    activeProvider: normalizeProvider(rawSettings.activeProvider),
+    apiKey: options.preserveApiKey !== false ? loadGeminiApiKey() : "",
     model: GEMINI_MODEL,
+    groqApiKey: options.preserveApiKey !== false ? loadGroqApiKey() : "",
+    groqModel: isValidGroqModel(rawSettings.groqModel)
+      ? rawSettings.groqModel
+      : DEFAULT_GROQ_MODEL,
     theme: normalizeTheme(rawSettings.theme),
     privacyAcknowledged: Boolean(rawSettings.privacyAcknowledged),
+    groqPrivacyAcknowledged: Boolean(rawSettings.groqPrivacyAcknowledged),
     autoMarkRead: rawSettings.autoMarkRead !== false,
     autoCleanupEnabled: rawSettings.autoCleanupEnabled === true,
-    retentionDays: typeof rawSettings.retentionDays === "number" && rawSettings.retentionDays > 0 ? rawSettings.retentionDays : 30,
+    retentionDays:
+      typeof rawSettings.retentionDays === "number" && rawSettings.retentionDays > 0
+        ? rawSettings.retentionDays
+        : 30,
+    syncMinutes:
+      typeof rawSettings.syncMinutes === "number" && rawSettings.syncMinutes >= 15
+        ? Math.floor(rawSettings.syncMinutes)
+        : 30,
     lastTestedAt: typeof rawSettings.lastTestedAt === "number" ? rawSettings.lastTestedAt : null,
+    groqLastTestedAt:
+      typeof rawSettings.groqLastTestedAt === "number" ? rawSettings.groqLastTestedAt : null,
+    groqTestedModel:
+      typeof rawSettings.groqTestedModel === "string" ? rawSettings.groqTestedModel : null,
     lastSyncAllAt: typeof rawSettings.lastSyncAllAt === "number" ? rawSettings.lastSyncAllAt : null,
-    geminiUsage: {
-      requests: Number(rawUsage.requests) || 0,
-      successful: Number(rawUsage.successful) || 0,
-      errors: Number(rawUsage.errors) || 0,
-      inputTokens: Number(rawUsage.inputTokens) || 0,
-      outputTokens: Number(rawUsage.outputTokens) || 0,
-      totalTokens: Number(rawUsage.totalTokens) || 0,
-      lastRequestAt: typeof rawUsage.lastRequestAt === "number" ? rawUsage.lastRequestAt : null,
-      lastErrorAt: typeof rawUsage.lastErrorAt === "number" ? rawUsage.lastErrorAt : null,
-      lastErrorKind: typeof rawUsage.lastErrorKind === "string" ? rawUsage.lastErrorKind : null,
-    },
+    geminiUsage: normalizeUsageStats(rawSettings.geminiUsage),
+    groqUsage: normalizeUsageStats(rawSettings.groqUsage),
   };
 
   if (rawSettings.model && rawSettings.model !== GEMINI_MODEL) {
@@ -359,8 +436,8 @@ export function migrateWorkspaceData(
 }
 
 function serializeWorkspace(data: WorkspaceData) {
-  // API-ключ намеренно не попадает в сериализованное рабочее пространство.
-  const { apiKey: _removed, ...safeSettings } = data.settings;
+  // API-ключи обоих провайдеров намеренно исключаются из сериализации и IndexedDB.
+  const { apiKey: _removedGemini, groqApiKey: _removedGroq, ...safeSettings } = data.settings;
   return JSON.stringify({
     schemaVersion: SCHEMA_VERSION,
     sources: data.sources,
@@ -373,7 +450,20 @@ function serializeWorkspace(data: WorkspaceData) {
 function loadWorkspace(): { data: WorkspaceData; didMigrate: boolean } {
   try {
     const raw = localStorage.getItem(WORKSPACE_KEY);
-    if (!raw) return { data: createEmptyWorkspace(), didMigrate: false };
+    if (!raw) {
+      const empty = createEmptyWorkspace();
+      return {
+        data: {
+          ...empty,
+          settings: {
+            ...empty.settings,
+            apiKey: loadGeminiApiKey(),
+            groqApiKey: loadGroqApiKey(),
+          },
+        },
+        didMigrate: false,
+      };
+    }
     const result = migrateWorkspaceData(JSON.parse(raw), { preserveApiKey: true });
     if (!result) return { data: createEmptyWorkspace(), didMigrate: false };
     return { data: result.data, didMigrate: result.migrated };
@@ -383,14 +473,14 @@ function loadWorkspace(): { data: WorkspaceData; didMigrate: boolean } {
 }
 
 export function buildExportPayload(data: WorkspaceData) {
-  const { apiKey: _removed, ...safeSettings } = data.settings;
+  const { apiKey: _removedGemini, groqApiKey: _removedGroq, ...safeSettings } = data.settings;
   return JSON.stringify(
     {
       app: "Dispatch — RSS в X",
-      exportVersion: 2,
+      exportVersion: 3,
       schemaVersion: SCHEMA_VERSION,
       exportedAt: new Date().toISOString(),
-      note: "API-ключ Google Gemini в экспорт никогда не включается.",
+      note: "API-ключи Google Gemini и Groq в экспорт никогда не включаются.",
       sources: data.sources,
       articles: data.articles,
       drafts: data.drafts,
@@ -472,9 +562,15 @@ interface StoreContextValue {
   dismissToast: (id: string) => void;
   syncingIds: string[];
   isRefreshingAll: boolean;
+  /** IndexedDB-гидратация завершена. До этого данные могут уточняться. */
+  hydrated: boolean;
+  /** Быстрый кэш localStorage существует (нет необходимости показывать индикатор восстановления). */
+  hasLocalCache: boolean;
   updateSettings: (patch: Partial<Omit<Settings, "model">>) => void;
   saveApiKey: (key: string) => void;
   clearApiKey: () => void;
+  saveGroqApiKey: (key: string) => void;
+  clearGroqApiKey: () => void;
   addSource: (input: {
     name: string;
     url: string;
@@ -494,7 +590,23 @@ interface StoreContextValue {
   markAllReadInSource: (sourceId: string) => void;
   undoMassChange: () => void;
   purgeOldArticles: () => number;
-  recordGeminiUsage: (stats: { inputTokens?: number; outputTokens?: number; error?: boolean; kind?: string }) => void;
+  recordAIUsage: (
+    provider: AIProvider,
+    stats: {
+      inputTokens?: number;
+      outputTokens?: number;
+      error?: boolean;
+      kind?: string;
+      detail?: string;
+    }
+  ) => void;
+  recordGeminiUsage: (stats: {
+    inputTokens?: number;
+    outputTokens?: number;
+    error?: boolean;
+    kind?: string;
+    detail?: string;
+  }) => void;
   deleteArticle: (id: string) => void;
   updateArticleExtraction: (
     id: string,
@@ -529,10 +641,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [syncingIds, setSyncingIds] = useState<string[]>([]);
   const [isRefreshingAll, setIsRefreshingAll] = useState(false);
   const [hydrated, setHydrated] = useState(false);
+  // Быстрый кэш в localStorage существует; первичным хранилищем является IndexedDB.
+  const [hasLocalCache, _setHasLocalCache] = useState(() => {
+    try {
+      return localStorage.getItem(WORKSPACE_KEY) !== null;
+    } catch {
+      return false;
+    }
+  });
   const shouldWriteAfterHydrate = useRef(initialRef.current.didMigrate);
   const dataRef = useRef(data);
   dataRef.current = data;
   const persistTimer = useRef<number | null>(null);
+  // Атомарная защита от повторного запуска синхронизации одного источника
+  // несколькими независимыми вызовами (ref обновляется синхронно, в отличие от state).
+  const inFlightSourcesRef = useRef<Set<string>>(new Set());
   const massUndoRef = useRef<MassChangeUndo | null>(null);
 
   const notify = useCallback((toast: Omit<ToastMessage, "id">) => {
@@ -547,68 +670,78 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setToasts((current) => current.filter((entry) => entry.id !== id));
   }, []);
 
-  // Сохранение в localStorage и IndexedDB (без API-ключа).
+  // Сохранение в IndexedDB (первичное) и localStorage (быстрый кэш). API-ключ не пишется.
   const writeNow = useCallback(
     (next: WorkspaceData) => {
       const savedAt = Date.now();
       const serialized = serializeWorkspace(next);
+      // IndexedDB — основной носитель: квоты заметно выше, данные переживают очистку кэша.
+      try {
+        void writeWorkspaceRecord(JSON.parse(serialized), savedAt);
+      } catch {
+        // IndexedDB недоступен — данные остаются в кэше и в памяти.
+      }
+      // localStorage — зеркало для мгновенного первого рендера.
+      // setItem атомен: при нехватке квоты старый кэш не повреждается,
+      // а при следующем запуске более свежий снимок из IndexedDB победит по savedAt.
       try {
         localStorage.setItem(WORKSPACE_KEY, serialized);
         localStorage.setItem(WORKSPACE_SAVED_AT_KEY, String(savedAt));
       } catch {
         notify({
-          title: "Хранилище браузера заполнено",
-          description: "Удалите ненужные статьи или черновики, чтобы освободить место.",
+          title: "Кэш браузера заполнен",
+          description: "Основные данные продолжают храниться в IndexedDB. Рекомендуем удалить старые статьи.",
           variant: "warning",
         });
-      }
-      try {
-        void writeWorkspaceRecord(JSON.parse(serialized), savedAt);
-      } catch {
-        // IndexedDB недоступен — кэш в localStorage продолжает работать.
       }
     },
     [notify]
   );
 
   // Восстановление и безопасная миграция из IndexedDB при запуске.
-  // Используем функциональный апдейт setData, чтобы не затереть свежий IndexedDB-контент
-  // устаревшим dataRef.current.
+  // Гонка исключена архитектурно: один и тот же объект-снимок передаётся в setData
+  // и в запись хранилища, поэтому устаревшее dataRef.current в игру не входит.
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const record = await readWorkspaceRecord();
-      if (cancelled) return;
-      let shouldWrite = shouldWriteAfterHydrate.current;
-      if (record) {
-        let localSavedAt = 0;
-        let hasLocal = false;
-        try {
-          hasLocal = localStorage.getItem(WORKSPACE_KEY) !== null;
-          localSavedAt = Number(localStorage.getItem(WORKSPACE_SAVED_AT_KEY) || 0);
-        } catch {
-          localSavedAt = 0;
-        }
-        if (!hasLocal || record.savedAt > localSavedAt) {
-          const migrated = migrateWorkspaceData(record.data, { preserveApiKey: true });
-          if (migrated) {
-            shouldWrite = true;
-            setData((current) => {
-              const merged = {
+      let snapshot: WorkspaceData | null = null;
+      try {
+        const record = await readWorkspaceRecord();
+        if (cancelled) return;
+        if (record) {
+          let localSavedAt = 0;
+          let hasLocal = false;
+          try {
+            hasLocal = localStorage.getItem(WORKSPACE_KEY) !== null;
+            localSavedAt = Number(localStorage.getItem(WORKSPACE_SAVED_AT_KEY) || 0);
+          } catch {
+            localSavedAt = 0;
+          }
+          if (!hasLocal || record.savedAt > localSavedAt) {
+            const migrated = migrateWorkspaceData(record.data, { preserveApiKey: true });
+            if (migrated) {
+              const merged: WorkspaceData = {
                 ...migrated.data,
-                settings: { ...migrated.data.settings, apiKey: current.settings.apiKey },
+                settings: {
+                  ...migrated.data.settings,
+                  apiKey: dataRef.current.settings.apiKey,
+                  groqApiKey: dataRef.current.settings.groqApiKey,
+                },
               };
-              return merged;
-            });
+              snapshot = merged;
+              setData(merged);
+            }
           }
         }
+      } catch {
+        // IndexedDB не читается — работаем с кэшем.
       }
+      if (cancelled) return;
+      const shouldWrite = shouldWriteAfterHydrate.current || snapshot !== null;
       if (shouldWrite) {
         shouldWriteAfterHydrate.current = false;
-        // После setData(…) вызываем запись именно в тот момент, когда React применил новый state.
-        setTimeout(() => {
-          if (!cancelled) writeNow(dataRef.current);
-        }, 0);
+        if (snapshot) writeNow(snapshot);
+        else writeNow(dataRef.current);
       }
       setHydrated(true);
     })().catch(() => setHydrated(true));
@@ -629,26 +762,50 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
   }, [data, hydrated, writeNow]);
 
-  // Восстановление API-ключа из chrome.storage.local (в контексте расширения).
+  // Восстановление API-ключей обоих провайдеров из chrome.storage.local (в контексте расширения).
   useEffect(() => {
     const local = extensionStorage();
     if (!local) return;
     let cancelled = false;
     local
-      .get("dispatchGeminiKeyV1")
+      .get([GEMINI_CHROME_STORAGE_KEY, GROQ_CHROME_STORAGE_KEY])
       .then((result) => {
-        const stored = result?.dispatchGeminiKeyV1;
-        if (cancelled || typeof stored !== "string" || !stored) return;
+        if (cancelled) return;
+        const storedGemini =
+          typeof result?.[GEMINI_CHROME_STORAGE_KEY] === "string"
+            ? (result[GEMINI_CHROME_STORAGE_KEY] as string)
+            : "";
+        const storedGroq =
+          typeof result?.[GROQ_CHROME_STORAGE_KEY] === "string"
+            ? (result[GROQ_CHROME_STORAGE_KEY] as string)
+            : "";
+        if (!storedGemini && !storedGroq) return;
+
         try {
-          localStorage.setItem(API_KEY_STORAGE, stored);
+          if (storedGemini) localStorage.setItem(GEMINI_API_KEY_STORAGE, storedGemini);
+          if (storedGroq) localStorage.setItem(GROQ_API_KEY_STORAGE, storedGroq);
         } catch {
-          // Используем ключ в памяти.
+          // Используем ключи в памяти.
         }
-        setData((current) =>
-          current.settings.apiKey
-            ? current
-            : { ...current, settings: { ...current.settings, apiKey: stored } }
-        );
+
+        setData((current) => {
+          const nextGemini = current.settings.apiKey || storedGemini;
+          const nextGroq = current.settings.groqApiKey || storedGroq;
+          if (
+            nextGemini === current.settings.apiKey &&
+            nextGroq === current.settings.groqApiKey
+          ) {
+            return current;
+          }
+          return {
+            ...current,
+            settings: {
+              ...current.settings,
+              apiKey: nextGemini,
+              groqApiKey: nextGroq,
+            },
+          };
+        });
       })
       .catch(() => undefined);
     return () => {
@@ -671,26 +828,40 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [data.settings.theme]);
 
   const updateSettings = useCallback((patch: Partial<Omit<Settings, "model">>) => {
-    if (typeof patch.apiKey === "string") persistApiKey(patch.apiKey);
-    setData((current) => ({
-      ...current,
-      settings: { ...current.settings, ...patch, model: GEMINI_MODEL },
-    }));
+    if (typeof patch.apiKey === "string") persistGeminiApiKey(patch.apiKey);
+    if (typeof patch.groqApiKey === "string") persistGroqApiKey(patch.groqApiKey);
+    setData((current) => {
+      const nextGroqModel =
+        patch.groqModel !== undefined
+          ? isValidGroqModel(patch.groqModel)
+            ? patch.groqModel
+            : current.settings.groqModel
+          : current.settings.groqModel;
+      return {
+        ...current,
+        settings: {
+          ...current.settings,
+          ...patch,
+          model: GEMINI_MODEL,
+          groqModel: nextGroqModel,
+        },
+      };
+    });
   }, []);
 
   const saveApiKey = useCallback(
     (key: string) => {
       const clean = key.trim();
-      persistApiKey(clean);
+      persistGeminiApiKey(clean);
       setData((current) => ({
         ...current,
         settings: { ...current.settings, apiKey: clean, model: GEMINI_MODEL, lastTestedAt: null },
       }));
       notify({
-        title: clean ? "API-ключ сохранён локально" : "API-ключ удалён",
+        title: clean ? "API-ключ Google Gemini сохранён" : "API-ключ Google Gemini удалён",
         description: clean
-          ? "Ключ хранится только в этом браузере и не включается в экспорт."
-          : "Генерация через Google Gemini отключена.",
+          ? "Ключ хранится только локально в этом браузере и не включается в экспорт."
+          : "Ключ Google Gemini удалён.",
         variant: clean ? "success" : "info",
       });
     },
@@ -698,7 +869,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   );
 
   const clearApiKey = useCallback(() => {
-    persistApiKey("");
+    persistGeminiApiKey("");
     setData((current) => ({
       ...current,
       settings: {
@@ -708,8 +879,51 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       },
     }));
     notify({
-      title: "API-ключ удалён",
-      description: "Сохранённые новости, источники и черновики не затронуты.",
+      title: "API-ключ Google Gemini удалён",
+      description: "Сохранённые новости, источники, черновики и настройки Groq не затронуты.",
+      variant: "info",
+    });
+  }, [notify]);
+
+  const saveGroqApiKey = useCallback(
+    (key: string) => {
+      const clean = key.trim();
+      persistGroqApiKey(clean);
+      // Сохранение ключа Groq не переключает активный провайдер автоматически.
+      setData((current) => ({
+        ...current,
+        settings: {
+          ...current.settings,
+          groqApiKey: clean,
+          groqLastTestedAt: null,
+          groqTestedModel: null,
+        },
+      }));
+      notify({
+        title: clean ? "API-ключ Groq сохранён" : "API-ключ Groq удалён",
+        description: clean
+          ? "Ключ хранится только локально в этом браузере и не включается в экспорт."
+          : "Ключ Groq удалён.",
+        variant: clean ? "success" : "info",
+      });
+    },
+    [notify]
+  );
+
+  const clearGroqApiKey = useCallback(() => {
+    persistGroqApiKey("");
+    setData((current) => ({
+      ...current,
+      settings: {
+        ...current.settings,
+        groqApiKey: "",
+        groqLastTestedAt: null,
+        groqTestedModel: null,
+      },
+    }));
+    notify({
+      title: "API-ключ Groq удалён",
+      description: "Сохранённые новости, источники, черновики и настройки Gemini не затронуты.",
       variant: "info",
     });
   }, [notify]);
@@ -728,6 +942,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       lastError: null,
       status: input.preview ? "ok" : "unknown",
       articleCount: 0,
+      feedItemCount: input.preview ? input.preview.items.length : undefined,
     };
 
     const previewArticles = input.preview
@@ -835,6 +1050,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                   lastError: null,
                   lastSyncAt: Date.now(),
                   articleCount: nextArticles.filter((article) => article.sourceId === sourceId).length,
+                  feedItemCount: result.total,
                   etag: result.etag ?? item.etag,
                   lastModified: result.lastModified ?? item.lastModified,
                 }
@@ -860,7 +1076,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const refreshSource = useCallback(
     async (id: string, requestPermission = true) => {
       const source = dataRef.current.sources.find((item) => item.id === id);
-      if (!source || syncingIds.includes(id)) return false;
+      // Атомарная защита: ref обновляется синхронно, поэтому два параллельных
+      // вызова (например, ручное обновление во время «Обновить все») не пересекутся.
+      if (!source || inFlightSourcesRef.current.has(id)) return false;
 
       if (requestPermission) {
         const granted = await ensureHostAccess(source.url);
@@ -875,6 +1093,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
+      inFlightSourcesRef.current.add(id);
       setSyncingIds((current) => [...current, id]);
       setData((current) => ({
         ...current,
@@ -883,15 +1102,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         ),
       }));
 
+      const startedAt = Date.now();
       try {
         const result = await syncSourceFeed(source, dataRef.current.articles);
         applySyncSuccess(id, result);
+        // Точный счётчик: считаем статьи, реально сохранённые после начала обновления.
+        const addedCount = dataRef.current.articles.filter((article) => article.fetchedAt >= startedAt && article.sourceId === id).length;
         notify({
           title: result.notModified ? `«${source.name}»: новых статей нет` : `«${source.name}» обновлён`,
           description: result.notModified
             ? "Лента не изменилась с прошлого обновления."
-            : result.articles.length > 0
-              ? `Добавлено: ${pluralRu(result.articles.length, "новая статья", "новые статьи", "новых статей")}.`
+            : addedCount > 0
+              ? `Добавлено: ${pluralRu(addedCount, "новая статья", "новые статьи", "новых статей")}.`
               : "Новых публикаций нет, дубликаты пропущены.",
           variant: "success",
         });
@@ -905,15 +1127,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         });
         return false;
       } finally {
+        inFlightSourcesRef.current.delete(id);
         setSyncingIds((current) => current.filter((entry) => entry !== id));
       }
     },
-    [applySyncError, applySyncSuccess, notify, syncingIds]
+    [applySyncError, applySyncSuccess, notify]
   );
+
+  const allRefreshRef = useRef(false);
 
   const refreshAll = useCallback(
     async (fromUserGesture = false) => {
-      if (isRefreshingAll) return;
+      if (allRefreshRef.current) return;
       const enabled = dataRef.current.sources.filter((source) => source.enabled);
       if (enabled.length === 0) {
         if (fromUserGesture) {
@@ -926,6 +1151,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
+      allRefreshRef.current = true;
+      // Блокируем индивидуальные обновления всех включённых источников на время пакетного обновления.
+      enabled.forEach((source) => inFlightSourcesRef.current.add(source.id));
       setIsRefreshingAll(true);
       setSyncingIds(enabled.map((source) => source.id));
       setData((current) => ({
@@ -935,19 +1163,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         ),
       }));
 
-      let addedTotal = 0;
-      let failures = 0;
+      const startedAt = Date.now();
+      const failedSources: string[] = [];
 
       await runWithConcurrency(enabled, FEED_CONCURRENCY, async (source) => {
         try {
           const result = await syncSourceFeed(source, dataRef.current.articles);
           applySyncSuccess(source.id, result);
-          addedTotal += result.articles.length;
         } catch (error) {
-          failures += 1;
+          failedSources.push(source.name);
           applySyncError(source.id, error);
         }
       });
+
+      // Точный итог: реально сохранённые новые статьи (дедупликация учтена в applySyncSuccess).
+      const addedTotal = dataRef.current.articles.filter((article) => article.fetchedAt >= startedAt).length;
 
       setData((current) => ({
         ...current,
@@ -955,18 +1185,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }));
       setIsRefreshingAll(false);
       setSyncingIds([]);
+      allRefreshRef.current = false;
+      enabled.forEach((source) => inFlightSourcesRef.current.delete(source.id));
 
-      // Сообщаем фоновому service worker об успешной синхронизации, чтобы снять отметку.
-      try {
-        const runtime = (
-          globalThis as unknown as { chrome?: { runtime?: { sendMessage?: (m: unknown) => Promise<unknown> } } }
-        ).chrome?.runtime;
-        void runtime?.sendMessage?.({ type: "dispatch:sync-complete" }).catch(() => undefined);
-      } catch {
-        // Вне расширения игнорируем.
+      // Снимаем отметку фонового service worker только при полностью успешном обновлении;
+      // при частичном сбое состояние «нужно повторить обновление» сохраняется.
+      if (failedSources.length === 0) {
+        try {
+          const runtime = (
+            globalThis as unknown as { chrome?: { runtime?: { sendMessage?: (m: unknown) => Promise<unknown> } } }
+          ).chrome?.runtime;
+          void runtime?.sendMessage?.({ type: "dispatch:sync-complete" }).catch(() => undefined);
+        } catch {
+          // Вне расширения игнорируем.
+        }
       }
 
-      if (failures === 0) {
+      if (failedSources.length === 0) {
         if (fromUserGesture || addedTotal > 0) {
           notify({
             title: "Ленты обновлены",
@@ -978,14 +1213,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           });
         }
       } else if (fromUserGesture) {
+        const failedList = failedSources.slice(0, 3).join(", ");
+        const more = failedSources.length > 3 ? ` и ещё ${failedSources.length - 3}` : "";
         notify({
-          title: `Не удалось обновить ${pluralRu(failures, "источник", "источника", "источников")}`,
-          description: "Остальные ленты обновлены. Подробности смотрите в разделе «Источники».",
-          variant: failures === enabled.length ? "error" : "warning",
+          title: `Не удалось обновить ${pluralRu(failedSources.length, "источник", "источника", "источников")}`,
+          description: `${failedList}${more}. Остальные ленты обновлены — попробуйте ещё раз в разделе «Источники».`,
+          variant: failedSources.length === enabled.length ? "error" : "warning",
         });
       }
     },
-    [applySyncError, applySyncSuccess, isRefreshingAll, notify]
+    [applySyncError, applySyncSuccess, notify]
   );
 
   const deleteArticle = useCallback(
@@ -1095,33 +1332,28 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const markAllReadInView = useCallback(
     (articleIds: string[], label = "Отмечено прочитанным") => {
       const ids = new Set(articleIds);
-      const affected: Array<{ id: string; readAt: number | null; savedAt: number | null }> = [];
       const now = Date.now();
+      // Списки изменений вычисляем ДО setData: апдейт-функция может выполняться
+      // отложенно, поэтому побочный сбор данных внутри неё ненадёжен.
+      const affected = dataRef.current.articles
+        .filter((article) => ids.has(article.id) && !article.readAt)
+        .map((article) => ({ id: article.id, readAt: article.readAt, savedAt: article.savedAt }));
+      if (affected.length === 0) return;
 
-      setData((current) => {
-        current.articles.forEach((article) => {
-          if (ids.has(article.id) && !article.readAt) {
-            affected.push({ id: article.id, readAt: article.readAt, savedAt: article.savedAt });
-          }
-        });
-        if (affected.length === 0) return current;
-        return {
-          ...current,
-          articles: current.articles.map((article) =>
-            ids.has(article.id) && !article.readAt ? { ...article, readAt: now } : article
-          ),
-        };
+      setData((current) => ({
+        ...current,
+        articles: current.articles.map((article) =>
+          ids.has(article.id) && !article.readAt ? { ...article, readAt: now } : article
+        ),
+      }));
+
+      massUndoRef.current = { label: "Отменить прочтение", changedIds: affected };
+      notify({
+        title: label,
+        description: `Изменено: ${pluralRu(affected.length, "статья", "статьи", "статей")}.`,
+        variant: "success",
+        action: { label: "Отменить", onClick: () => undoMassChangeRef.current?.() },
       });
-
-      if (affected.length > 0) {
-        massUndoRef.current = { label: "Отменить прочтение", changedIds: affected };
-        notify({
-          title: label,
-          description: `Изменено: ${pluralRu(affected.length, "статья", "статьи", "статей")}.`,
-          variant: "success",
-          action: { label: "Отменить", onClick: () => undoMassChangeRef.current?.() },
-        });
-      }
     },
     [notify]
   );
@@ -1189,7 +1421,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       if (!source || !source.nextOlderPage) {
         return { added: 0, pagesFetched: 0, finished: true };
       }
-      if (syncingIds.includes(sourceId)) {
+      if (inFlightSourcesRef.current.has(sourceId)) {
         return { added: 0, pagesFetched: 0, finished: false };
       }
 
@@ -1203,6 +1435,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         return { added: 0, pagesFetched: 0, finished: false };
       }
 
+      inFlightSourcesRef.current.add(sourceId);
+      const startedAt = Date.now();
       setSyncingIds((current) => [...current, sourceId]);
       setData((current) => ({
         ...current,
@@ -1254,12 +1488,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             ),
           }));
         }
-        notify({
-          title: `Архив «${source.name}» загружен`,
-          description: `Добавлено: ${pluralRu(result.articles.length, "старая статья", "старые статьи", "старых статей")}${result.pagesFetched > 0 ? ` (${pluralRu(result.pagesFetched, "страница", "страницы", "страниц")})` : ""}.`,
-          variant: "success",
-        });
-        return { added: result.articles.length, pagesFetched: result.pagesFetched, finished: result.finished };
+        const addedCount = dataRef.current.articles.filter(
+          (article) => article.fetchedAt >= startedAt && article.sourceId === sourceId
+        ).length;
+        if (addedCount === 0) {
+          notify({
+            title: `Больше старых публикаций нет`,
+            description: "Все доступные в архиве публикации уже загружены.",
+            variant: "info",
+          });
+        } else {
+          notify({
+            title: `Архив «${source.name}» загружен`,
+            description: `Добавлено: ${pluralRu(addedCount, "старая публикация", "старые публикации", "старых публикаций")}${result.pagesFetched > 1 ? ` (${pluralRu(result.pagesFetched, "страница", "страницы", "страниц")})` : ""}.`,
+            variant: "success",
+          });
+        }
+        return { added: addedCount, pagesFetched: result.pagesFetched, finished: result.finished };
       } catch (error) {
         applySyncError(sourceId, error);
         notify({
@@ -1269,22 +1514,25 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         });
         return { added: 0, pagesFetched: 0, finished: false };
       } finally {
+        inFlightSourcesRef.current.delete(sourceId);
         setSyncingIds((current) => current.filter((entry) => entry !== sourceId));
       }
     },
-    [applySyncError, notify, syncingIds]
+    [applySyncError, notify]
   );
 
-  const recordGeminiUsage = useCallback(
-    (stats: { inputTokens?: number; outputTokens?: number; error?: boolean; kind?: string }) => {
+  const recordAIUsage = useCallback<StoreContextValue["recordAIUsage"]>(
+    (provider, stats) => {
       setData((current) => {
-        const usage = current.settings.geminiUsage;
-        const next = { ...usage };
+        const key = provider === "groq" ? "groqUsage" : "geminiUsage";
+        const usage = current.settings[key];
+        const next: AIUsageStats = { ...usage };
         next.requests += 1;
         if (stats.error) {
           next.errors += 1;
           next.lastErrorAt = Date.now();
           next.lastErrorKind = stats.kind || "unknown";
+          next.lastErrorDetail = stats.detail || next.lastErrorDetail;
         } else {
           next.successful += 1;
         }
@@ -1294,15 +1542,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         next.lastRequestAt = Date.now();
         return {
           ...current,
-          settings: { ...current.settings, geminiUsage: next },
+          settings: { ...current.settings, [key]: next },
         };
       });
     },
     []
   );
 
+  const recordGeminiUsage = useCallback<StoreContextValue["recordGeminiUsage"]>(
+    (stats) => recordAIUsage("gemini", stats),
+    [recordAIUsage]
+  );
+
   const resetDraftToOriginal = useCallback(
     (id: string) => {
+      const target = dataRef.current.drafts.find((item) => item.id === id);
+      const providerLabel = target ? AI_PROVIDER_LABELS[target.provider] : "ИИ";
       setData((current) => ({
         ...current,
         drafts: current.drafts.map((draft) =>
@@ -1313,7 +1568,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }));
       notify({
         title: "Исходный текст восстановлен",
-        description: "Возвращён первоначальный вариант от Google Gemini.",
+        description: `Возвращён первоначальный вариант от ${providerLabel}.`,
         variant: "info",
       });
     },
@@ -1338,11 +1593,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const { data: imported, counts } = parseImportPayload(raw);
       setData((current) => ({
         ...imported,
-        settings: { ...imported.settings, apiKey: current.settings.apiKey, model: GEMINI_MODEL },
+        settings: {
+          ...imported.settings,
+          // Оба локальных API-ключа текущего пользователя сохраняются неизменными.
+          apiKey: current.settings.apiKey,
+          groqApiKey: current.settings.groqApiKey,
+          model: GEMINI_MODEL,
+        },
       }));
       notify({
         title: "Данные импортированы",
-        description: `Загружено: ${pluralRu(counts.sources, "источник", "источника", "источников")}, ${pluralRu(counts.articles, "статья", "статьи", "статей")}, ${pluralRu(counts.drafts, "черновик", "черновика", "черновиков")}.`,
+        description: `Загружено: ${pluralRu(counts.sources, "источник", "источника", "источников")}, ${pluralRu(counts.articles, "статья", "статьи", "статей")}, ${pluralRu(counts.drafts, "черновик", "черновика", "черновиков")}. Локальные API-ключи сохранены.`,
         variant: "success",
       });
       return counts;
@@ -1358,15 +1619,28 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       drafts: [],
       settings: {
         ...DEFAULT_SETTINGS,
+        // Пользовательские настройки и оба API-ключа сохраняются — удаляются только новости/источники/черновики.
+        activeProvider: current.settings.activeProvider,
         apiKey: current.settings.apiKey,
+        groqApiKey: current.settings.groqApiKey,
+        groqModel: current.settings.groqModel,
         theme: current.settings.theme,
         privacyAcknowledged: current.settings.privacyAcknowledged,
+        groqPrivacyAcknowledged: current.settings.groqPrivacyAcknowledged,
+        autoMarkRead: current.settings.autoMarkRead,
+        autoCleanupEnabled: current.settings.autoCleanupEnabled,
+        retentionDays: current.settings.retentionDays,
+        syncMinutes: current.settings.syncMinutes,
         lastTestedAt: current.settings.lastTestedAt,
+        groqLastTestedAt: current.settings.groqLastTestedAt,
+        groqTestedModel: current.settings.groqTestedModel,
+        geminiUsage: current.settings.geminiUsage,
+        groqUsage: current.settings.groqUsage,
       },
     }));
     notify({
       title: "Локальные данные удалены",
-      description: "Источники, статьи и черновики очищены. API-ключ и тема сохранены.",
+      description: "Источники, статьи и черновики очищены. API-ключи и настройки сохранены.",
       variant: "info",
     });
   }, [notify]);
@@ -1383,9 +1657,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       dismissToast,
       syncingIds,
       isRefreshingAll,
+      hydrated,
+      hasLocalCache,
       updateSettings,
       saveApiKey,
       clearApiKey,
+      saveGroqApiKey,
+      clearGroqApiKey,
       addSource,
       updateSource,
       deleteSource,
@@ -1409,12 +1687,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       markAllReadInSource,
       undoMassChange,
       purgeOldArticles,
+      recordAIUsage,
       recordGeminiUsage,
     }),
     [
       addSource,
       clearAllData,
       clearApiKey,
+      clearGroqApiKey,
       data,
       deleteArticle,
       deleteDraft,
@@ -1429,6 +1709,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       refreshSource,
       resetDraftToOriginal,
       saveApiKey,
+      saveGroqApiKey,
       saveGeneratedDraft,
       syncingIds,
       toasts,
@@ -1444,7 +1725,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       markAllReadInSource,
       undoMassChange,
       purgeOldArticles,
+      recordAIUsage,
       recordGeminiUsage,
+      hydrated,
+      hasLocalCache,
     ]
   );
 

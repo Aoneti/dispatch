@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
 import type { PageKey, Source } from "./lib/types";
-import { DEFAULT_SYNC_MINUTES } from "./lib/types";
 import { pushUnreadCountToBadge, StoreProvider, useStore } from "./lib/store";
 import { cn } from "./lib/utils";
 import { BottomNav, Sidebar, Topbar } from "./components/shell";
@@ -12,7 +11,16 @@ import { DraftsPage } from "./pages/DraftsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
 function Workspace() {
-  const { refreshAll, purgeOldArticles, settings, articles } = useStore();
+  const {
+    refreshAll,
+    purgeOldArticles,
+    settings,
+    articles,
+    markRead,
+    toggleSaved,
+    hydrated,
+    hasLocalCache,
+  } = useStore();
   const [page, setPage] = useState<PageKey>("inbox");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
@@ -66,13 +74,34 @@ function Workspace() {
       return () => runtime.onMessage?.removeListener?.(handler);
     }
 
+    // Интервал берётся из настроек пользователя (минимум 15 минут).
+    const minutes = Math.max(15, Math.floor(settings.syncMinutes) || 30);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") {
         void refreshAll(false);
       }
-    }, DEFAULT_SYNC_MINUTES * 60_000);
+    }, minutes * 60_000);
     return () => window.clearInterval(timer);
-  }, [refreshAll]);
+  }, [refreshAll, settings.syncMinutes]);
+
+  // Передаём выбранный интервал фоновому service worker для Chrome Alarms.
+  useEffect(() => {
+    const local = (
+      globalThis as unknown as {
+        chrome?: {
+          storage?: {
+            local?: {
+              set: (items: Record<string, unknown>) => Promise<void>;
+            };
+          };
+        };
+      }
+    ).chrome?.storage?.local;
+    if (!local?.set) return;
+    void local
+      .set({ dispatchSyncMinutes: Math.max(15, Math.floor(settings.syncMinutes) || 30) })
+      .catch(() => undefined);
+  }, [settings.syncMinutes]);
 
   // Если фоновое расписание сработало, пока панель была закрыта, обновляем только RSS при открытии.
   useEffect(() => {
@@ -112,7 +141,36 @@ function Workspace() {
     pushUnreadCountToBadge(articles);
   }, [articles]);
 
+  // Клавиатурное управление в открытом просмотре: R — прочитано/не прочитано, S — в сохранённые.
+  useEffect(() => {
+    if (page !== "inbox" || !selectedArticleId) return;
+    const article = articles.find((a) => a.id === selectedArticleId);
+    if (!article) return;
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const typing =
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.tagName === "SELECT" ||
+        target?.isContentEditable;
+      if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "r") {
+        event.preventDefault();
+        markRead(article.id, article.readAt === null);
+      } else if (key === "s") {
+        event.preventDefault();
+        toggleSaved(article.id);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [page, selectedArticleId, articles, markRead, toggleSaved]);
+
   const splitLayout = page === "inbox" || page === "drafts";
+  // Индикатор восстановления данных показываем только когда быстрого кэша нет
+  // (при наличии кэша первый рендер мгновенный, IndexedDB лишь уточняет данные).
+  const restoring = !hydrated && !hasLocalCache;
 
   return (
     <div className="flex h-[100dvh] min-h-0 overflow-hidden bg-paper text-ink">
@@ -127,6 +185,15 @@ function Workspace() {
         <Topbar page={page} onOpenMobile={() => setMobileNavOpen(true)} />
 
         <main className={cn("min-h-0 flex-1", splitLayout ? "overflow-hidden" : "overflow-y-auto")}>
+          {restoring ? (
+            <div className="flex h-full items-center justify-center">
+              <div className="flex flex-col items-center gap-3 text-center">
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-line border-t-accent" />
+                <p className="text-[12px] text-muted">Восстановление данных из локального хранилища…</p>
+              </div>
+            </div>
+          ) : (
+          <>
           {page === "inbox" && (
             <InboxPage
               selectedId={selectedArticleId}
@@ -147,6 +214,8 @@ function Workspace() {
             />
           )}
           {page === "settings" && <SettingsPage />}
+          </>
+          )}
         </main>
 
         <BottomNav page={page} onNavigate={navigate} />

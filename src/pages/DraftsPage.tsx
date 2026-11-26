@@ -12,6 +12,7 @@ import {
   Trash2,
 } from "lucide-react";
 import type { Draft } from "../lib/types";
+import { AI_PROVIDER_LABELS } from "../lib/types";
 import { useStore } from "../lib/store";
 import { Badge, Button, ConfirmDialog, EmptyState } from "../components/ui";
 import {
@@ -160,6 +161,9 @@ export function DraftsPage({ selectedDraftId, onSelectDraft, onOpenInbox }: Draf
                 </p>
                 <div className="mt-1.5 flex items-center gap-2 text-[11px] text-muted">
                   <span className="truncate">{draft.sourceName}</span>
+                  <span className="shrink-0 font-mono text-[10px] text-faint">
+                    · {draft.provider === "groq" ? "Groq" : "Gemini"}
+                  </span>
                   {draft.edited && <span className="text-faint">· изменён</span>}
                   <span
                     className={cn(
@@ -218,7 +222,9 @@ export function DraftsPage({ selectedDraftId, onSelectDraft, onOpenInbox }: Draf
                   <span className="text-line-strong">·</span>
                   <span>{formatDateTime(active.createdAt)}</span>
                   <span className="text-line-strong">·</span>
-                  <span className="font-mono text-[10.5px] text-faint">{active.model}</span>
+                  <span className="font-mono text-[10.5px] text-faint">
+                    {AI_PROVIDER_LABELS[active.provider]} · {active.model}
+                  </span>
                 </div>
               </div>
 
@@ -293,7 +299,7 @@ export function DraftsPage({ selectedDraftId, onSelectDraft, onOpenInbox }: Draf
             onClose={() => setResetOpen(false)}
             onConfirm={() => resetDraftToOriginal(active.id)}
             title="Вернуть исходный текст ИИ?"
-            description="Ваши ручные правки в этом черновике будут заменены первоначальным вариантом от Google Gemini."
+            description={`Ваши ручные правки в этом черновике будут заменены первоначальным вариантом от ${AI_PROVIDER_LABELS[active.provider]}.`}
             note="Второй формат поста (если он создан) не изменится."
             confirmLabel="Вернуть исходный"
             tone="primary"
@@ -420,7 +426,7 @@ function DraftEditorBox({
             size="sm"
             disabled={!draft.edited}
             onClick={onReset}
-            title="Вернуть исходный вариант от Google Gemini"
+            title={`Вернуть исходный вариант от ${AI_PROVIDER_LABELS[draft.provider]}`}
             icon={<RotateCcw size={13} />}
           >
             <span className="hidden sm:inline">Исходный текст</span>

@@ -38,7 +38,8 @@
   --ink: #17181c;
   --ink-soft: #33353b;
   --muted: #5e5b54;
-  --faint: #8a867d;
+  /* Контраст к фону не ниже WCAG AA (4.5:1) для мелкого текста. */
+  --faint: #6f6a61;
   --line: #e0dccf;
   --line-strong: #c9c3b2;
   --accent: #d94f2b;

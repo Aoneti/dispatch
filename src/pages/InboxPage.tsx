@@ -17,10 +17,10 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import type { Article, Draft, DraftFormat } from "../lib/types";
-import { GEMINI_MODEL } from "../lib/types";
+import type { AIProvider, Article, Draft, DraftFormat } from "../lib/types";
+import { AI_PROVIDER_LABELS, GEMINI_MODEL } from "../lib/types";
 import { fetchArticlePage } from "../lib/feeds";
-import { generateLongPost, generateShortPost, GeminiError } from "../lib/gemini";
+import { AIProviderError, generateLongPost, generateShortPost } from "../lib/ai";
 import { ensureHostAccess } from "../lib/permissions";
 import { useStore } from "../lib/store";
 import {
@@ -32,7 +32,7 @@ import {
   Input,
   Select,
 } from "../components/ui";
-import { GeminiConsentDialog, ReplaceDraftDialog } from "../components/GenerateDialog";
+import { ProviderConsentDialog, ReplaceDraftDialog } from "../components/GenerateDialog";
 import {
   charCount,
   cn,
@@ -43,6 +43,7 @@ import {
   formatNumber,
   formatTime,
   pluralRu,
+  sanitizeHtml,
   uid,
 } from "../lib/utils";
 
@@ -59,9 +60,32 @@ interface InboxProps {
   onOpenSettings: () => void;
 }
 
+interface GenerationSnapshot {
+  provider: AIProvider;
+  apiKey: string;
+  model: string;
+  article: Article;
+  format: DraftFormat;
+}
+
 type GenerationFeedback =
-  | { kind: "insufficient"; articleId: string; format: DraftFormat; warnings: string[] }
-  | { kind: "error"; articleId: string; format: DraftFormat; message: string; technical?: string; retryAfterMs?: number };
+  | {
+      kind: "insufficient";
+      articleId: string;
+      provider: AIProvider;
+      format: DraftFormat;
+      warnings: string[];
+    }
+  | {
+      kind: "error";
+      articleId: string;
+      provider: AIProvider;
+      format: DraftFormat;
+      message: string;
+      technical?: string;
+      retryAfterMs?: number;
+      retryable?: boolean;
+    };
 
 export function InboxPage({
   selectedId,
@@ -488,18 +512,21 @@ function ArticleReader({
     markRead,
     toggleSaved,
     notify,
-    recordGeminiUsage,
+    recordAIUsage,
   } = useStore();
 
   const [extracting, setExtracting] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
-  // Строгая блокировка параллельных и повторных запросов к Gemini.
+  // Строгая блокировка параллельных и повторных AI-запросов.
   const [generating, setGenerating] = useState<{ articleId: string; format: DraftFormat } | null>(null);
   const inFlightRef = useRef(false);
 
-  const [consentFor, setConsentFor] = useState<DraftFormat | null>(null);
-  const [replaceTarget, setReplaceTarget] = useState<{ format: DraftFormat; draft: Draft } | null>(null);
+  const [consentSnapshot, setConsentSnapshot] = useState<GenerationSnapshot | null>(null);
+  const [replaceTarget, setReplaceTarget] = useState<{
+    snapshot: GenerationSnapshot;
+    draft: Draft;
+  } | null>(null);
   const [feedback, setFeedback] = useState<GenerationFeedback | null>(null);
 
   // Автоматическое прочтение при реальном открытии статьи.
@@ -542,23 +569,29 @@ function ArticleReader({
   const isGeneratingShort = generating?.articleId === article.id && generating.format === "short";
   const isGeneratingLong = generating?.articleId === article.id && generating.format === "long";
 
-  // Единственная точка вызова Gemini для генерации — строго по клику пользователя.
-  const executeGeneration = async (
-    targetArticle: Article,
-    format: DraftFormat,
-    apiKey: string,
-    replaceId?: string
-  ) => {
+  const activeProvider = settings.activeProvider;
+  const activeModel = activeProvider === "groq" ? settings.groqModel : GEMINI_MODEL;
+  const activeProviderLabel = AI_PROVIDER_LABELS[activeProvider];
+
+  // Единственная точка вызова AI-генерации — строго по клику пользователя и по зафиксированному snapshot.
+  // Смена провайдера или модели в настройках во время запроса не влияет на уже запущенный запрос.
+  const executeGeneration = async (snapshot: GenerationSnapshot, replaceId?: string) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
-    setGenerating({ articleId: targetArticle.id, format });
+    setGenerating({ articleId: snapshot.article.id, format: snapshot.format });
     setFeedback(null);
 
     try {
+      const dispatchOptions = {
+        provider: snapshot.provider,
+        apiKey: snapshot.apiKey,
+        model: snapshot.model,
+        article: snapshot.article,
+      };
       const result =
-        format === "short"
-          ? await generateShortPost({ apiKey, article: targetArticle })
-          : await generateLongPost({ apiKey, article: targetArticle });
+        snapshot.format === "short"
+          ? await generateShortPost(dispatchOptions)
+          : await generateLongPost(dispatchOptions);
 
       if (result.status === "insufficient_source" || !result.post.trim()) {
         const warnings =
@@ -569,8 +602,9 @@ function ArticleReader({
               ];
         setFeedback({
           kind: "insufficient",
-          articleId: targetArticle.id,
-          format,
+          articleId: snapshot.article.id,
+          provider: snapshot.provider,
+          format: snapshot.format,
           warnings,
         });
         notify({
@@ -584,14 +618,15 @@ function ArticleReader({
       const now = Date.now();
       const draft: Draft = {
         id: uid("draft"),
-        articleId: targetArticle.id,
-        articleTitle: targetArticle.title,
-        sourceName: targetArticle.sourceName,
-        sourceUrl: targetArticle.url,
+        articleId: snapshot.article.id,
+        articleTitle: snapshot.article.title,
+        sourceName: snapshot.article.sourceName,
+        sourceUrl: snapshot.article.url,
         createdAt: now,
         updatedAt: now,
-        model: GEMINI_MODEL,
-        format,
+        provider: result.provider,
+        model: result.model,
+        format: snapshot.format,
         originalText: result.post,
         text: result.post,
         warnings: result.warnings,
@@ -603,31 +638,48 @@ function ArticleReader({
 
       const saved = saveGeneratedDraft(draft, replaceId);
       const count = charCount(saved.text);
+      recordAIUsage(snapshot.provider, {
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+      });
       notify({
-        title: format === "short" ? "Короткий пост готов" : "Расширенный пост готов",
-        description: `${pluralRu(count, "символ", "символа", "символов")} · проверьте текст перед публикацией.`,
+        title: snapshot.format === "short" ? "Короткий пост готов" : "Расширенный пост готов",
+        description: `${AI_PROVIDER_LABELS[saved.provider]} · ${pluralRu(count, "символ", "символа", "символов")} · проверьте текст перед публикацией.`,
         variant: "success",
       });
       onOpenDraft(saved.id);
     } catch (caught) {
       const error =
-        caught instanceof GeminiError
+        caught instanceof AIProviderError
           ? caught
-          : new GeminiError("unknown", "Не удалось выполнить генерацию. Попробуйте позже.");
+          : new AIProviderError(
+              snapshot.provider,
+              "unknown",
+              "Не удалось выполнить генерацию. Попробуйте позже."
+            );
       setFeedback({
         kind: "error",
-        articleId: targetArticle.id,
-        format,
+        articleId: snapshot.article.id,
+        provider: snapshot.provider,
+        format: snapshot.format,
         message: error.message,
         technical: error.technical,
         retryAfterMs: error.retryAfterMs,
+        retryable: error.retryable,
       });
       notify({
-        title: format === "short" ? "Ошибка генерации короткого поста" : "Ошибка генерации расширенного поста",
+        title:
+          snapshot.format === "short"
+            ? "Ошибка генерации короткого поста"
+            : "Ошибка генерации расширенного поста",
         description: error.message,
         variant: "error",
       });
-      recordGeminiUsage({ error: true, kind: error.kind });
+      recordAIUsage(snapshot.provider, {
+        error: true,
+        kind: error.kind,
+        detail: error.technical || error.kind,
+      });
     } finally {
       inFlightRef.current = false;
       setGenerating(null);
@@ -637,30 +689,45 @@ function ArticleReader({
   const handleGenerateClick = (format: DraftFormat) => {
     if (inFlightRef.current || isBusy) return;
 
-    if (!settings.apiKey || !settings.privacyAcknowledged) {
-      setConsentFor(format);
+    // Фиксируем snapshot настроек активного провайдера в момент нажатия кнопки.
+    const provider = settings.activeProvider;
+    const isGroq = provider === "groq";
+    const snapshot: GenerationSnapshot = {
+      provider,
+      apiKey: isGroq ? settings.groqApiKey : settings.apiKey,
+      model: isGroq ? settings.groqModel : GEMINI_MODEL,
+      article,
+      format,
+    };
+    const hasConsent = isGroq ? settings.groqPrivacyAcknowledged : settings.privacyAcknowledged;
+
+    if (!snapshot.apiKey || !hasConsent) {
+      setConsentSnapshot(snapshot);
       return;
     }
 
     const existing = format === "short" ? existingShort : existingLong;
     if (existing) {
-      setReplaceTarget({ format, draft: existing });
+      setReplaceTarget({ snapshot, draft: existing });
       return;
     }
 
-    void executeGeneration(article, format, settings.apiKey);
+    void executeGeneration(snapshot);
   };
 
-  const handleConsentProceed = (apiKey: string) => {
-    if (!consentFor) return;
-    const format = consentFor;
-    setConsentFor(null);
-    const existing = format === "short" ? existingShort : existingLong;
+  const handleConsentProceed = (resolvedApiKey: string) => {
+    if (!consentSnapshot) return;
+    const snapshot: GenerationSnapshot = {
+      ...consentSnapshot,
+      apiKey: resolvedApiKey,
+    };
+    setConsentSnapshot(null);
+    const existing = snapshot.format === "short" ? existingShort : existingLong;
     if (existing) {
-      setReplaceTarget({ format, draft: existing });
+      setReplaceTarget({ snapshot, draft: existing });
       return;
     }
-    void executeGeneration(article, format, apiKey);
+    void executeGeneration(snapshot);
   };
 
   const handleExtract = async () => {
@@ -835,8 +902,9 @@ function ArticleReader({
               </Button>
             </div>
             <p className="mt-2 text-[11px] leading-relaxed text-muted">
-              Каждый формат запрашивается отдельно через Google Gemini ({GEMINI_MODEL}). Короткий —
-              1–2 предложения (~200–280 симв.), расширенный — 3–5 предложений (~500 симв.).
+              Каждый формат запрашивается отдельно через {activeProviderLabel} ({activeModel}).
+              Короткий — 1–2 предложения (~200–280 симв.), расширенный — 3–5 предложений (~450–550
+              симв.).
             </p>
 
             {(existingShort || existingLong) && (
@@ -894,19 +962,21 @@ function ArticleReader({
             </div>
           )}
 
-          {/* Сообщение об ошибке Gemini */}
+          {/* Сообщение об ошибке AI-провайдера */}
           {activeFeedback?.kind === "error" && (
             <div className="anim-rise mt-3 rounded-[7px] border border-rose/30 bg-rose/[0.06] p-3.5">
               <div className="flex items-start gap-2">
                 <AlertTriangle size={15} className="mt-0.5 shrink-0 text-rose" />
                 <div className="min-w-0 flex-1">
-                  <p className="text-[12.5px] font-semibold text-ink">Не удалось создать пост</p>
+                  <p className="text-[12.5px] font-semibold text-ink">
+                    Не удалось создать пост ({AI_PROVIDER_LABELS[activeFeedback.provider]})
+                  </p>
                   <p className="mt-1 text-[12px] leading-relaxed text-ink-soft">
                     {activeFeedback.message}
                   </p>
                   {activeFeedback.retryAfterMs && (
                     <p className="mt-1 text-[11px] text-muted">
-                      Google рекомендует повторить через{" "}
+                      {AI_PROVIDER_LABELS[activeFeedback.provider]} рекомендует повторить через{" "}
                       {Math.max(1, Math.ceil(activeFeedback.retryAfterMs / 1000))} сек.
                     </p>
                   )}
@@ -914,6 +984,18 @@ function ArticleReader({
                     <p className="mt-1.5 font-mono text-[10.5px] text-muted">
                       Код ответа: {activeFeedback.technical}
                     </p>
+                  )}
+                  {activeFeedback.retryable && (
+                    <div className="mt-2">
+                      <Button
+                        variant="secondary"
+                        size="xs"
+                        onClick={() => handleGenerateClick(activeFeedback.format)}
+                        icon={<RefreshCw size={11} />}
+                      >
+                        Повторить запрос
+                      </Button>
+                    </div>
                   )}
                 </div>
               </div>
@@ -949,11 +1031,12 @@ function ArticleReader({
             </div>
           )}
 
-          {/* Содержимое статьи */}
+          {/* Содержимое статьи. Санитизация непосредственно перед рендерингом —
+              защита даже от записей, уже прошедших через хранилище/импорт. */}
           {article.contentHtml ? (
             <div
               className="prose-editorial mt-5"
-              dangerouslySetInnerHTML={{ __html: article.contentHtml }}
+              dangerouslySetInnerHTML={{ __html: sanitizeHtml(article.contentHtml) }}
             />
           ) : (
             <p className="mt-5 font-serif text-[16px] leading-[1.7] text-ink-soft">
@@ -978,11 +1061,13 @@ function ArticleReader({
         </article>
       </div>
 
-      {/* Диалог ключа / согласия перед первой генерацией */}
-      <GeminiConsentDialog
-        open={consentFor !== null}
-        format={consentFor || "short"}
-        onClose={() => setConsentFor(null)}
+      {/* Диалог ключа / согласия перед первой генерацией для выбранного провайдера */}
+      <ProviderConsentDialog
+        open={consentSnapshot !== null}
+        provider={consentSnapshot?.provider || activeProvider}
+        model={consentSnapshot?.model || activeModel}
+        format={consentSnapshot?.format || "short"}
+        onClose={() => setConsentSnapshot(null)}
         onProceed={handleConsentProceed}
         onOpenSettings={onOpenSettings}
       />
@@ -991,12 +1076,13 @@ function ArticleReader({
       <ReplaceDraftDialog
         open={replaceTarget !== null}
         draft={replaceTarget?.draft || null}
+        targetProvider={replaceTarget?.snapshot.provider || activeProvider}
         onClose={() => setReplaceTarget(null)}
         onOpenExisting={onOpenDraft}
         onConfirmReplace={() => {
           if (!replaceTarget) return;
-          const { format, draft } = replaceTarget;
-          void executeGeneration(article, format, settings.apiKey, draft.id);
+          const { snapshot, draft } = replaceTarget;
+          void executeGeneration(snapshot, draft.id);
         }}
       />
 

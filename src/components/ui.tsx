@@ -439,6 +439,18 @@ export function ToastViewport() {
             {toast.description && (
               <p className="mt-0.5 text-[11px] leading-relaxed text-paper/75">{toast.description}</p>
             )}
+            {toast.action && (
+              <button
+                type="button"
+                onClick={() => {
+                  toast.action?.onClick();
+                  dismissToast(toast.id);
+                }}
+                className="mt-1.5 rounded-[4px] border border-white/20 px-2 py-0.5 text-[11px] font-medium text-paper/90 transition-colors hover:bg-white/10"
+              >
+                {toast.action.label}
+              </button>
+            )}
           </div>
           <button
             type="button"

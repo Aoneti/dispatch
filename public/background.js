@@ -8,14 +8,26 @@
 
 const ALARM_NAME = "dispatch-rss-sync";
 const DEFAULT_SYNC_MINUTES = 30;
+const MIN_SYNC_MINUTES = 15; // Chrome Alarms не поддерживает интервалы короче 1 минуты, 15 — разумный минимум.
 const BADGE_COLOR = "#d94f2b";
 
+async function readSyncMinutes() {
+  try {
+    const res = await chrome.storage.local.get("dispatchSyncMinutes");
+    const value = Number(res.dispatchSyncMinutes);
+    return Number.isFinite(value) && value >= MIN_SYNC_MINUTES ? Math.floor(value) : DEFAULT_SYNC_MINUTES;
+  } catch {
+    return DEFAULT_SYNC_MINUTES;
+  }
+}
+
 async function scheduleAutoSync() {
+  const minutes = await readSyncMinutes();
   try {
     await chrome.alarms.clear(ALARM_NAME);
     await chrome.alarms.create(ALARM_NAME, {
-      delayInMinutes: DEFAULT_SYNC_MINUTES,
-      periodInMinutes: DEFAULT_SYNC_MINUTES,
+      delayInMinutes: minutes,
+      periodInMinutes: minutes,
     });
   } catch (error) {
     console.warn("Не удалось настроить расписание обновления Dispatch:", error);
@@ -105,6 +117,13 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) {
     void markSyncDue();
+  }
+});
+
+// При изменении пользовательского интервала в настройках пересоздаём alarm.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.dispatchSyncMinutes) {
+    void scheduleAutoSync();
   }
 });
 
